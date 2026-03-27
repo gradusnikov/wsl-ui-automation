@@ -1,0 +1,301 @@
+#!/bin/bash
+
+# Defaults
+FILENAME=""
+HIDE_WINDOW=false
+SCREEN_INDEX=""
+DELAY=0
+REGION=""
+CAPTURE_WINDOW=false
+CAPTURE_CLIPBOARD=false
+CAPTURE_ALL=false
+SCALE=""
+OPEN_AFTER=false
+TITLE=""
+CROP=""
+
+# Parse arguments — first positional arg (not starting with -) is the filename
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --hide|-h)
+      HIDE_WINDOW=true
+      shift
+      ;;
+    --screen|-s)
+      SCREEN_INDEX="$2"
+      shift 2
+      ;;
+    --delay|-d)
+      DELAY="$2"
+      shift 2
+      ;;
+    --region|-r)
+      REGION="$2"
+      shift 2
+      ;;
+    --window|-w)
+      CAPTURE_WINDOW=true
+      shift
+      ;;
+    --clipboard|-c)
+      CAPTURE_CLIPBOARD=true
+      shift
+      ;;
+    --all|-a)
+      CAPTURE_ALL=true
+      shift
+      ;;
+    --title|-t)
+      TITLE="$2"
+      shift 2
+      ;;
+    --crop)
+      CROP="$2"
+      shift 2
+      ;;
+    --scale)
+      SCALE="$2"
+      shift 2
+      ;;
+    --open|-o)
+      OPEN_AFTER=true
+      shift
+      ;;
+    --list|-l)
+      powershell.exe -Command "
+Add-Type -AssemblyName System.Windows.Forms;
+\$screens = [System.Windows.Forms.Screen]::AllScreens;
+for (\$i = 0; \$i -lt \$screens.Length; \$i++) {
+  \$s = \$screens[\$i];
+  \$p = if (\$s.Primary) { ' (primary)' } else { '' };
+  Write-Host \"[\$i] \$(\$s.DeviceName)\$p - \$(\$s.Bounds.Width)x\$(\$s.Bounds.Height) at (\$(\$s.Bounds.X),\$(\$s.Bounds.Y))\"
+}"
+      exit 0
+      ;;
+    --help)
+      cat <<'HELP'
+Usage: screenshot [FILENAME] [OPTIONS]
+
+Captures screen content on WSL/Windows.
+Default filename: /tmp/screenshot.png
+
+Capture modes (mutually exclusive):
+  --screen N, -s N    Capture screen N (use --list to see screens)
+  --window, -w        Capture the active/focused window
+  --title P, -t P     Capture window matching title/process P (no focus needed)
+  --crop X,Y,W,H      Crop the result to a rectangle (applied after capture)
+  --region X,Y,W,H    Capture a specific rectangle (-r 100,200,800,600)
+  --clipboard, -c     Save clipboard image to file
+  --all, -a           Capture all monitors stitched into one image
+
+Options:
+  --hide, -h          Hide the terminal window before capturing
+  --delay N, -d N     Wait N seconds before capturing
+  --scale N           Downscale by percentage (e.g. --scale 50)
+  --open, -o          Open the image after saving
+  --list, -l          List available screens
+  --help              Show this help
+HELP
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      if [ -z "$FILENAME" ]; then
+        FILENAME="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Default filename to /tmp/screenshot.png
+if [ -z "$FILENAME" ]; then
+  FILENAME="/tmp/screenshot.png"
+fi
+
+# Resolve to Windows path
+if [[ "$FILENAME" = /* ]]; then
+  WIN_PATH="$(wslpath -w "$FILENAME")"
+else
+  WIN_PATH="$(wslpath -w "$(pwd)/${FILENAME}")"
+fi
+
+# --- Build PowerShell command ---
+
+PS_CMD='Add-Type -AssemblyName System.Windows.Forms,System.Drawing;'
+
+# Win32 helpers for hide, active window, and title-based capture
+if [ "$HIDE_WINDOW" = true ] || [ "$CAPTURE_WINDOW" = true ] || [ -n "$TITLE" ]; then
+  PS_CMD+='
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Collections.Generic;
+public class Win32 {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+}
+"@;'
+fi
+
+# Hide terminal
+if [ "$HIDE_WINDOW" = true ]; then
+  PS_CMD+='
+$procs = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 };
+$wt = $procs | Where-Object { $_.ProcessName -eq "WindowsTerminal" } | Select-Object -First 1;
+if ($wt) { $hwnd_term = $wt.MainWindowHandle } else {
+  $wt = $procs | Where-Object { $_.ProcessName -match "cmd|powershell|conhost" } | Select-Object -First 1;
+  $hwnd_term = $wt.MainWindowHandle;
+};
+[Win32]::ShowWindow($hwnd_term, 0) | Out-Null;
+Start-Sleep -Milliseconds 300;'
+fi
+
+# Delay
+if [ "$DELAY" -gt 0 ] 2>/dev/null; then
+  PS_CMD+="
+Start-Sleep -Seconds ${DELAY};"
+fi
+
+# Capture mode
+if [ -n "$TITLE" ]; then
+  PS_CMD+="
+\$pattern = '${TITLE}'.ToLower();
+\$targetHwnd = [IntPtr]::Zero;
+\$windows = New-Object System.Collections.ArrayList;
+[Win32]::EnumWindows({
+  param(\$h, \$l)
+  if ([Win32]::IsWindowVisible(\$h)) {
+    \$len = [Win32]::GetWindowTextLength(\$h);
+    if (\$len -gt 0) { \$windows.Add(\$h) | Out-Null }
+  }
+  return \$true
+}, [IntPtr]::Zero) | Out-Null;
+foreach (\$w in \$windows) {
+  \$len = [Win32]::GetWindowTextLength(\$w);
+  \$sb = New-Object System.Text.StringBuilder (\$len + 1);
+  [Win32]::GetWindowText(\$w, \$sb, \$sb.Capacity) | Out-Null;
+  \$wtitle = \$sb.ToString().ToLower();
+  \$wpid = [uint32]0;
+  [Win32]::GetWindowThreadProcessId(\$w, [ref]\$wpid) | Out-Null;
+  \$proc = '';
+  try { \$proc = (Get-Process -Id \$wpid -ErrorAction SilentlyContinue).ProcessName.ToLower() } catch {};
+  if (\$wtitle.Contains(\$pattern) -or \$proc.Contains(\$pattern)) {
+    \$targetHwnd = \$w; break;
+  }
+}
+if (\$targetHwnd -eq [IntPtr]::Zero) { Write-Error 'No window found matching: ${TITLE}'; exit 1 };
+\$rect = New-Object Win32+RECT;
+[Win32]::GetWindowRect(\$targetHwnd, [ref]\$rect) | Out-Null;
+\$tw = \$rect.Right - \$rect.Left;
+\$th = \$rect.Bottom - \$rect.Top;
+\$b = New-Object System.Drawing.Bitmap \$tw,\$th;
+\$g = [System.Drawing.Graphics]::FromImage(\$b);
+\$hdc = \$g.GetHdc();
+[Win32]::PrintWindow(\$targetHwnd, \$hdc, 2) | Out-Null;
+\$g.ReleaseHdc(\$hdc);"
+
+elif [ "$CAPTURE_CLIPBOARD" = true ]; then
+  PS_CMD+='
+$img = [System.Windows.Forms.Clipboard]::GetImage();
+if ($img -eq $null) { Write-Error "No image on clipboard"; exit 1 };
+$b = New-Object System.Drawing.Bitmap $img;'
+
+elif [ "$CAPTURE_WINDOW" = true ]; then
+  PS_CMD+='
+$hwnd_fg = [Win32]::GetForegroundWindow();
+$rect = New-Object Win32+RECT;
+[Win32]::GetWindowRect($hwnd_fg, [ref]$rect) | Out-Null;
+$w = $rect.Right - $rect.Left;
+$h = $rect.Bottom - $rect.Top;
+$b = New-Object System.Drawing.Bitmap $w,$h;
+$g = [System.Drawing.Graphics]::FromImage($b);
+$g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, (New-Object System.Drawing.Size $w,$h));'
+
+elif [ -n "$REGION" ]; then
+  IFS=',' read -r RX RY RW RH <<< "$REGION"
+  PS_CMD+="
+\$b = New-Object System.Drawing.Bitmap ${RW},${RH};
+\$g = [System.Drawing.Graphics]::FromImage(\$b);
+\$g.CopyFromScreen(${RX}, ${RY}, 0, 0, (New-Object System.Drawing.Size ${RW},${RH}));"
+
+elif [ "$CAPTURE_ALL" = true ]; then
+  PS_CMD+='
+$allBounds = [System.Windows.Forms.SystemInformation]::VirtualScreen;
+$b = New-Object System.Drawing.Bitmap $allBounds.Width,$allBounds.Height;
+$g = [System.Drawing.Graphics]::FromImage($b);
+$g.CopyFromScreen($allBounds.Location, [System.Drawing.Point]::Empty, $allBounds.Size);'
+
+elif [ -n "$SCREEN_INDEX" ]; then
+  PS_CMD+="
+\$s = [System.Windows.Forms.Screen]::AllScreens[${SCREEN_INDEX}].Bounds;
+\$b = New-Object System.Drawing.Bitmap \$s.Width,\$s.Height;
+\$g = [System.Drawing.Graphics]::FromImage(\$b);
+\$g.CopyFromScreen(\$s.Location, [System.Drawing.Point]::Empty, \$s.Size);"
+
+else
+  PS_CMD+='
+$s = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;
+$b = New-Object System.Drawing.Bitmap $s.Width,$s.Height;
+$g = [System.Drawing.Graphics]::FromImage($b);
+$g.CopyFromScreen($s.Location, [System.Drawing.Point]::Empty, $s.Size);'
+fi
+
+# Scale
+if [ -n "$SCALE" ]; then
+  PS_CMD+="
+\$newW = [int](\$b.Width * ${SCALE} / 100);
+\$newH = [int](\$b.Height * ${SCALE} / 100);
+\$scaled = New-Object System.Drawing.Bitmap \$newW,\$newH;
+\$gs = [System.Drawing.Graphics]::FromImage(\$scaled);
+\$gs.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic;
+\$gs.DrawImage(\$b, 0, 0, \$newW, \$newH);
+\$gs.Dispose();
+\$b.Dispose();
+\$b = \$scaled;"
+fi
+
+# Crop
+if [ -n "$CROP" ]; then
+  IFS=',' read -r CX CY CW CH <<< "$CROP"
+  PS_CMD+="
+\$cropped = New-Object System.Drawing.Bitmap ${CW},${CH};
+\$gc = [System.Drawing.Graphics]::FromImage(\$cropped);
+\$gc.DrawImage(\$b, 0, 0, (New-Object System.Drawing.Rectangle ${CX},${CY},${CW},${CH}), [System.Drawing.GraphicsUnit]::Pixel);
+\$gc.Dispose();
+\$b.Dispose();
+\$b = \$cropped;"
+fi
+
+# Save
+PS_CMD+="
+\$b.Save('${WIN_PATH}');"
+
+# Restore terminal
+if [ "$HIDE_WINDOW" = true ]; then
+  PS_CMD+='
+[Win32]::ShowWindow($hwnd_term, 9) | Out-Null;'
+fi
+
+# Execute
+powershell.exe -Command "$PS_CMD"
+
+echo "Saved: $FILENAME"
+
+# Open after saving
+if [ "$OPEN_AFTER" = true ]; then
+  cmd.exe /C start "" "$(wslpath -w "$FILENAME")" 2>/dev/null
+fi

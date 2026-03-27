@@ -1,0 +1,306 @@
+#!/bin/bash
+
+# Mouse control for WSL — move, click, drag, scroll via PowerShell/user32.dll
+
+show_help() {
+  cat <<'HELP'
+Usage: mouse <command> [args]
+
+Commands:
+  pos                         Print current cursor position
+  move X,Y                    Move cursor to X,Y
+  click [X,Y]                 Left click (optionally move first)
+  rclick [X,Y]                Right click
+  mclick [X,Y]                Middle click
+  dclick [X,Y]                Double left click
+  drag X1,Y1 X2,Y2            Drag from (X1,Y1) to (X2,Y2)
+  scroll up|down [N]           Scroll N notches (default 3)
+  scroll left|right [N]        Horizontal scroll N notches (default 3)
+  hold X,Y                    Press and hold left button at X,Y (for drag start)
+  release [X,Y]               Release left button (optionally at X,Y)
+  help                        Show this help
+
+Options:
+  --delay N, -d N             Wait N seconds before action
+  --title P, -t P             Move coordinates relative to target window
+
+Coordinates are absolute screen pixels unless --title is used,
+in which case they are relative to the target window's top-left corner.
+
+Examples:
+  mouse pos                          Get cursor position
+  mouse click 500,300                Click at (500,300)
+  mouse rclick 800,400               Right click at (800,400)
+  mouse dclick 200,100               Double click
+  mouse drag 100,200 500,300         Drag from (100,200) to (500,300)
+  mouse scroll down 5                Scroll down 5 notches
+  mouse scroll up                    Scroll up 3 notches (default)
+  mouse click 50,80 -t notepad       Click at (50,80) relative to Notepad window
+  mouse -d 2 click 500,300           Wait 2s then click
+HELP
+  exit 0
+}
+
+# Parse global options first
+DELAY=0
+TITLE=""
+ARGS=()
+
+for arg in "$@"; do
+  ARGS+=("$arg")
+done
+
+# Extract --delay and --title from anywhere in args
+CLEAN_ARGS=()
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+  case "${ARGS[$i]}" in
+    --delay|-d)
+      DELAY="${ARGS[$((i+1))]}"
+      i=$((i+2))
+      ;;
+    --title|-t)
+      TITLE="${ARGS[$((i+1))]}"
+      i=$((i+2))
+      ;;
+    *)
+      CLEAN_ARGS+=("${ARGS[$i]}")
+      i=$((i+1))
+      ;;
+  esac
+done
+
+CMD="${CLEAN_ARGS[0]:-help}"
+ARG1="${CLEAN_ARGS[1]:-}"
+ARG2="${CLEAN_ARGS[2]:-}"
+
+# --- Build PowerShell ---
+
+# Common Win32 type definition
+WIN32_TYPE='
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class Mouse {
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+  public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+  public const uint MOUSEEVENTF_LEFTUP = 0x0004;
+  public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+  public const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+  public const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+  public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+  public const uint MOUSEEVENTF_WHEEL = 0x0800;
+  public const uint MOUSEEVENTF_HWHEEL = 0x1000;
+
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+}
+"@'
+
+# Helper: resolve --title to window offset
+TITLE_RESOLVE=""
+if [ -n "$TITLE" ]; then
+  TITLE_RESOLVE="
+\$pattern = '${TITLE}'.ToLower();
+\$targetHwnd = [IntPtr]::Zero;
+\$windows = New-Object System.Collections.ArrayList;
+[Mouse]::EnumWindows({
+  param(\$h, \$l)
+  if ([Mouse]::IsWindowVisible(\$h)) {
+    \$len = [Mouse]::GetWindowTextLength(\$h);
+    if (\$len -gt 0) { \$windows.Add(\$h) | Out-Null }
+  }
+  return \$true
+}, [IntPtr]::Zero) | Out-Null;
+foreach (\$w in \$windows) {
+  \$len = [Mouse]::GetWindowTextLength(\$w);
+  \$sb = New-Object System.Text.StringBuilder (\$len + 1);
+  [Mouse]::GetWindowText(\$w, \$sb, \$sb.Capacity) | Out-Null;
+  \$wtitle = \$sb.ToString().ToLower();
+  \$wpid = [uint32]0;
+  [Mouse]::GetWindowThreadProcessId(\$w, [ref]\$wpid) | Out-Null;
+  \$proc = '';
+  try { \$proc = (Get-Process -Id \$wpid -ErrorAction SilentlyContinue).ProcessName.ToLower() } catch {};
+  if (\$wtitle.Contains(\$pattern) -or \$proc.Contains(\$pattern)) {
+    \$targetHwnd = \$w; break;
+  }
+}
+if (\$targetHwnd -eq [IntPtr]::Zero) { Write-Error 'No window found matching: ${TITLE}'; exit 1 };
+\$wrect = New-Object Mouse+RECT;
+[Mouse]::GetWindowRect(\$targetHwnd, [ref]\$wrect) | Out-Null;
+\$offX = \$wrect.Left;
+\$offY = \$wrect.Top;"
+fi
+
+# Parse coordinates helper
+parse_coords() {
+  local coords="$1"
+  local xvar="$2"
+  local yvar="$3"
+  IFS=',' read -r "$xvar" "$yvar" <<< "$coords"
+}
+
+case "$CMD" in
+  pos)
+    powershell.exe -Command "
+${WIN32_TYPE}
+\$p = New-Object Mouse+POINT;
+[Mouse]::GetCursorPos([ref]\$p) | Out-Null;
+Write-Host \"\$(\$p.X),\$(\$p.Y)\"
+" | tr -d '\r'
+    ;;
+
+  move)
+    parse_coords "$ARG1" MX MY
+    powershell.exe -Command "
+${WIN32_TYPE}
+${TITLE_RESOLVE}
+$([ "$DELAY" -gt 0 ] && echo "Start-Sleep -Seconds ${DELAY};")
+\$tx = ${MX}; \$ty = ${MY};
+$([ -n "$TITLE" ] && echo '$tx += $offX; $ty += $offY;')
+[Mouse]::SetCursorPos(\$tx, \$ty) | Out-Null;
+" | tr -d '\r'
+    ;;
+
+  click|rclick|mclick|dclick)
+    case "$CMD" in
+      click)  DOWN="MOUSEEVENTF_LEFTDOWN";  UP="MOUSEEVENTF_LEFTUP" ;;
+      rclick) DOWN="MOUSEEVENTF_RIGHTDOWN"; UP="MOUSEEVENTF_RIGHTUP" ;;
+      mclick) DOWN="MOUSEEVENTF_MIDDLEDOWN"; UP="MOUSEEVENTF_MIDDLEUP" ;;
+      dclick) DOWN="MOUSEEVENTF_LEFTDOWN";  UP="MOUSEEVENTF_LEFTUP" ;;
+    esac
+
+    MOVE_CMD=""
+    if [ -n "$ARG1" ]; then
+      parse_coords "$ARG1" MX MY
+      MOVE_CMD="\$tx = ${MX}; \$ty = ${MY};
+$([ -n "$TITLE" ] && echo '$tx += $offX; $ty += $offY;')
+[Mouse]::SetCursorPos(\$tx, \$ty) | Out-Null;
+Start-Sleep -Milliseconds 50;"
+    fi
+
+    CLICK_CMD="[Mouse]::mouse_event([Mouse]::${DOWN}, 0, 0, 0, [UIntPtr]::Zero);
+Start-Sleep -Milliseconds 30;
+[Mouse]::mouse_event([Mouse]::${UP}, 0, 0, 0, [UIntPtr]::Zero);"
+
+    if [ "$CMD" = "dclick" ]; then
+      CLICK_CMD="${CLICK_CMD}
+Start-Sleep -Milliseconds 50;
+${CLICK_CMD}"
+    fi
+
+    powershell.exe -Command "
+${WIN32_TYPE}
+${TITLE_RESOLVE}
+$([ "$DELAY" -gt 0 ] && echo "Start-Sleep -Seconds ${DELAY};")
+${MOVE_CMD}
+${CLICK_CMD}
+" | tr -d '\r'
+    ;;
+
+  drag)
+    parse_coords "$ARG1" X1 Y1
+    parse_coords "$ARG2" X2 Y2
+    powershell.exe -Command "
+${WIN32_TYPE}
+${TITLE_RESOLVE}
+$([ "$DELAY" -gt 0 ] && echo "Start-Sleep -Seconds ${DELAY};")
+\$sx = ${X1}; \$sy = ${Y1}; \$ex = ${X2}; \$ey = ${Y2};
+$([ -n "$TITLE" ] && echo '$sx += $offX; $sy += $offY; $ex += $offX; $ey += $offY;')
+[Mouse]::SetCursorPos(\$sx, \$sy) | Out-Null;
+Start-Sleep -Milliseconds 50;
+[Mouse]::mouse_event([Mouse]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero);
+Start-Sleep -Milliseconds 50;
+# Smooth drag in steps
+\$steps = 20;
+for (\$i = 1; \$i -le \$steps; \$i++) {
+  \$cx = \$sx + [int]((\$ex - \$sx) * \$i / \$steps);
+  \$cy = \$sy + [int]((\$ey - \$sy) * \$i / \$steps);
+  [Mouse]::SetCursorPos(\$cx, \$cy) | Out-Null;
+  Start-Sleep -Milliseconds 10;
+}
+Start-Sleep -Milliseconds 50;
+[Mouse]::mouse_event([Mouse]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero);
+" | tr -d '\r'
+    ;;
+
+  scroll)
+    DIR="${ARG1:-down}"
+    NOTCHES="${ARG2:-3}"
+    case "$DIR" in
+      up)    WHEEL_FLAG="MOUSEEVENTF_WHEEL";  DELTA=$((120 * NOTCHES)) ;;
+      down)  WHEEL_FLAG="MOUSEEVENTF_WHEEL";  DELTA=$((-120 * NOTCHES)) ;;
+      left)  WHEEL_FLAG="MOUSEEVENTF_HWHEEL"; DELTA=$((-120 * NOTCHES)) ;;
+      right) WHEEL_FLAG="MOUSEEVENTF_HWHEEL"; DELTA=$((120 * NOTCHES)) ;;
+      *)     echo "Unknown scroll direction: $DIR" >&2; exit 1 ;;
+    esac
+    powershell.exe -Command "
+${WIN32_TYPE}
+${TITLE_RESOLVE}
+$([ "$DELAY" -gt 0 ] && echo "Start-Sleep -Seconds ${DELAY};")
+$([ -n "$TITLE" ] && echo '
+$cx = $offX + ($wrect.Right - $wrect.Left) / 2;
+$cy = $offY + ($wrect.Bottom - $wrect.Top) / 2;
+[Mouse]::SetCursorPos($cx, $cy) | Out-Null;
+Start-Sleep -Milliseconds 50;')
+[Mouse]::mouse_event([Mouse]::${WHEEL_FLAG}, 0, 0, ${DELTA}, [UIntPtr]::Zero);
+" | tr -d '\r'
+    ;;
+
+  hold)
+    MOVE_CMD=""
+    if [ -n "$ARG1" ]; then
+      parse_coords "$ARG1" MX MY
+      MOVE_CMD="\$tx = ${MX}; \$ty = ${MY};
+$([ -n "$TITLE" ] && echo '$tx += $offX; $ty += $offY;')
+[Mouse]::SetCursorPos(\$tx, \$ty) | Out-Null;
+Start-Sleep -Milliseconds 50;"
+    fi
+    powershell.exe -Command "
+${WIN32_TYPE}
+${TITLE_RESOLVE}
+$([ "$DELAY" -gt 0 ] && echo "Start-Sleep -Seconds ${DELAY};")
+${MOVE_CMD}
+[Mouse]::mouse_event([Mouse]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero);
+" | tr -d '\r'
+    ;;
+
+  release)
+    MOVE_CMD=""
+    if [ -n "$ARG1" ]; then
+      parse_coords "$ARG1" MX MY
+      MOVE_CMD="\$tx = ${MX}; \$ty = ${MY};
+$([ -n "$TITLE" ] && echo '$tx += $offX; $ty += $offY;')
+[Mouse]::SetCursorPos(\$tx, \$ty) | Out-Null;
+Start-Sleep -Milliseconds 50;"
+    fi
+    powershell.exe -Command "
+${WIN32_TYPE}
+${TITLE_RESOLVE}
+$([ "$DELAY" -gt 0 ] && echo "Start-Sleep -Seconds ${DELAY};")
+${MOVE_CMD}
+[Mouse]::mouse_event([Mouse]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero);
+" | tr -d '\r'
+    ;;
+
+  help|--help|-h)
+    show_help
+    ;;
+
+  *)
+    echo "Unknown command: $CMD. Use 'mouse help' for usage." >&2
+    exit 1
+    ;;
+esac

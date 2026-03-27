@@ -1,0 +1,291 @@
+#!/bin/bash
+
+# Send keyboard events to the focused window via PowerShell SendKeys
+# Usage: sendkeys [OPTIONS] [TEXT or --key COMBO]
+
+DELAY=0
+REPEAT=1
+KEYS=()
+TEXT=""
+PAUSE_BETWEEN=0
+TITLE=""
+
+show_help() {
+  cat <<'HELP'
+Usage: sendkeys [OPTIONS] [TEXT]
+
+Send keyboard events to the focused window.
+
+Modes:
+  sendkeys "hello world"             Type text
+  sendkeys --key enter               Press a special key
+  sendkeys --key ctrl+c              Key combination
+  sendkeys --keys "tab,tab,enter"    Sequence of keys
+
+Options:
+  --key KEY, -k KEY       Send a key or combo (can be repeated)
+  --keys SEQ              Comma-separated sequence of keys
+  --title P, -t P         Target window by title/process (focuses it first)
+  --delay N, -d N         Wait N seconds before sending
+  --repeat N, -r N        Repeat the key/text N times
+  --pause N, -p N         Pause N milliseconds between repeats/sequence steps
+  --help                  Show this help
+
+Special keys:
+  enter, tab, escape/esc, backspace/bs, delete/del, space,
+  up, down, left, right, home, end, pageup/pgup, pagedown/pgdn,
+  f1-f12, insert/ins, printscreen/prtsc, capslock, numlock, scrolllock
+
+Modifiers (combine with +):
+  ctrl, alt, shift, win
+
+Examples:
+  sendkeys "Hello World"                  Type text
+  sendkeys --key enter                    Press Enter
+  sendkeys --key ctrl+s                   Ctrl+S (save)
+  sendkeys --key ctrl+shift+s             Ctrl+Shift+S
+  sendkeys --key alt+tab                  Alt+Tab
+  sendkeys --key alt+f4                   Alt+F4
+  sendkeys --keys "ctrl+a,ctrl+c"         Select all, copy
+  sendkeys -d 2 --key enter               Wait 2s, press Enter
+  sendkeys -r 5 --key tab                 Press Tab 5 times
+  sendkeys -r 3 -p 500 --key down         Press Down 3x, 500ms apart
+  sendkeys --key win+d                    Show desktop
+  sendkeys -t notepad "Hello"             Type into Notepad without manual focus
+  sendkeys -t chrome --key ctrl+t         New tab in Chrome
+HELP
+  exit 0
+}
+
+# Map friendly key names to SendKeys format
+map_key() {
+  local key="$1"
+  local modifiers=""
+  local main_key=""
+
+  # Split on + for modifiers
+  IFS='+' read -ra parts <<< "$key"
+
+  if [ ${#parts[@]} -eq 1 ]; then
+    main_key="${parts[0]}"
+  else
+    # Last part is the main key, rest are modifiers
+    for ((i=0; i<${#parts[@]}-1; i++)); do
+      case "${parts[$i],,}" in
+        ctrl|control)  modifiers+="^" ;;
+        alt)           modifiers+="%" ;;
+        shift)         modifiers+="+" ;;
+        win)           modifiers+="^({ESC})" ;; # Win key approximation
+      esac
+    done
+    main_key="${parts[-1]}"
+  fi
+
+  # Map the main key
+  local mapped=""
+  case "${main_key,,}" in
+    enter|return)     mapped="{ENTER}" ;;
+    tab)              mapped="{TAB}" ;;
+    escape|esc)       mapped="{ESC}" ;;
+    backspace|bs)     mapped="{BACKSPACE}" ;;
+    delete|del)       mapped="{DELETE}" ;;
+    space)            mapped=" " ;;
+    up)               mapped="{UP}" ;;
+    down)             mapped="{DOWN}" ;;
+    left)             mapped="{LEFT}" ;;
+    right)            mapped="{RIGHT}" ;;
+    home)             mapped="{HOME}" ;;
+    end)              mapped="{END}" ;;
+    pageup|pgup)      mapped="{PGUP}" ;;
+    pagedown|pgdn)    mapped="{PGDN}" ;;
+    insert|ins)       mapped="{INSERT}" ;;
+    printscreen|prtsc) mapped="{PRTSC}" ;;
+    capslock)         mapped="{CAPSLOCK}" ;;
+    numlock)          mapped="{NUMLOCK}" ;;
+    scrolllock)       mapped="{SCROLLLOCK}" ;;
+    f[0-9]|f[0-9][0-9]) mapped="{${main_key^^}}" ;;
+    # Single character or already formatted
+    *)                mapped="${main_key}" ;;
+  esac
+
+  # Handle win key specially — use keybd_event instead
+  if [[ "$key" =~ ^win\+ ]]; then
+    echo "WIN:${main_key,,}"
+    return
+  fi
+
+  echo "${modifiers}${mapped}"
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --key|-k)
+      KEYS+=("$2")
+      shift 2
+      ;;
+    --keys)
+      IFS=',' read -ra seq <<< "$2"
+      for k in "${seq[@]}"; do
+        KEYS+=("$(echo "$k" | xargs)")  # trim whitespace
+      done
+      shift 2
+      ;;
+    --title|-t)
+      TITLE="$2"
+      shift 2
+      ;;
+    --delay|-d)
+      DELAY="$2"
+      shift 2
+      ;;
+    --repeat|-r)
+      REPEAT="$2"
+      shift 2
+      ;;
+    --pause|-p)
+      PAUSE_BETWEEN="$2"
+      shift 2
+      ;;
+    --help)
+      show_help
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      TEXT="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$TEXT" ] && [ ${#KEYS[@]} -eq 0 ]; then
+  echo "Error: provide text or --key/--keys. Use --help for usage." >&2
+  exit 1
+fi
+
+# Build PowerShell
+PS_CMD='Add-Type -AssemblyName System.Windows.Forms;'
+
+# Focus target window by title/process if specified
+if [ -n "$TITLE" ]; then
+  PS_CMD+="
+Add-Type @\"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Collections.Generic;
+public class WinTarget {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport(\"user32.dll\")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+}
+\"@;
+\$pattern = '${TITLE}'.ToLower();
+\$targetHwnd = [IntPtr]::Zero;
+\$windows = New-Object System.Collections.ArrayList;
+[WinTarget]::EnumWindows({
+  param(\$h, \$l)
+  if ([WinTarget]::IsWindowVisible(\$h)) {
+    \$len = [WinTarget]::GetWindowTextLength(\$h);
+    if (\$len -gt 0) { \$windows.Add(\$h) | Out-Null }
+  }
+  return \$true
+}, [IntPtr]::Zero) | Out-Null;
+foreach (\$w in \$windows) {
+  \$len = [WinTarget]::GetWindowTextLength(\$w);
+  \$sb = New-Object System.Text.StringBuilder (\$len + 1);
+  [WinTarget]::GetWindowText(\$w, \$sb, \$sb.Capacity) | Out-Null;
+  \$wtitle = \$sb.ToString().ToLower();
+  \$wpid = [uint32]0;
+  [WinTarget]::GetWindowThreadProcessId(\$w, [ref]\$wpid) | Out-Null;
+  \$proc = '';
+  try { \$proc = (Get-Process -Id \$wpid -ErrorAction SilentlyContinue).ProcessName.ToLower() } catch {};
+  if (\$wtitle.Contains(\$pattern) -or \$proc.Contains(\$pattern)) {
+    \$targetHwnd = \$w; break;
+  }
+}
+if (\$targetHwnd -eq [IntPtr]::Zero) { Write-Error 'No window found matching: ${TITLE}'; exit 1 };
+if ([WinTarget]::IsIconic(\$targetHwnd)) { [WinTarget]::ShowWindow(\$targetHwnd, 9) | Out-Null };
+[WinTarget]::SetForegroundWindow(\$targetHwnd) | Out-Null;
+Start-Sleep -Milliseconds 200;"
+fi
+
+# For Win key combos, we need keybd_event
+HAS_WIN=false
+for k in "${KEYS[@]}"; do
+  if [[ "${k,,}" =~ ^win\+ ]]; then
+    HAS_WIN=true
+    break
+  fi
+done
+
+if [ "$HAS_WIN" = true ]; then
+  PS_CMD+='
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinKey {
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+  public const byte VK_LWIN = 0x5B;
+  public const uint KEYEVENTF_KEYUP = 0x0002;
+}
+"@;'
+fi
+
+# Delay
+if [ "$DELAY" -gt 0 ] 2>/dev/null; then
+  PS_CMD+="Start-Sleep -Seconds ${DELAY};"
+fi
+
+# Build the send sequence
+for ((r=1; r<=REPEAT; r++)); do
+  if [ -n "$TEXT" ]; then
+    # Use clipboard to paste text — avoids all SendKeys escaping issues
+    # Save current clipboard, set our text, paste, restore
+    SAFE_TEXT="${TEXT//\'/\'\'}"
+    PS_CMD+="\$oldClip = [System.Windows.Forms.Clipboard]::GetText();"
+    PS_CMD+="[System.Windows.Forms.Clipboard]::SetText('${SAFE_TEXT}');"
+    PS_CMD+="Start-Sleep -Milliseconds 50;"
+    PS_CMD+="[System.Windows.Forms.SendKeys]::SendWait('^v');"
+    PS_CMD+="Start-Sleep -Milliseconds 50;"
+    PS_CMD+="if (\$oldClip) { [System.Windows.Forms.Clipboard]::SetText(\$oldClip) } else { [System.Windows.Forms.Clipboard]::Clear() };"
+  fi
+
+  for k in "${KEYS[@]}"; do
+    if [[ "${k,,}" =~ ^win\+(.+) ]]; then
+      # Win key combo — use keybd_event
+      local_key="${BASH_REMATCH[1]}"
+      # Get virtual key code for the key
+      vk_upper="${local_key^^}"
+      PS_CMD+="
+[WinKey]::keybd_event([WinKey]::VK_LWIN, 0, 0, [UIntPtr]::Zero);
+Start-Sleep -Milliseconds 50;
+[System.Windows.Forms.SendKeys]::SendWait('${local_key}');
+Start-Sleep -Milliseconds 50;
+[WinKey]::keybd_event([WinKey]::VK_LWIN, 0, [WinKey]::KEYEVENTF_KEYUP, [UIntPtr]::Zero);"
+    else
+      mapped=$(map_key "$k")
+      PS_CMD+="[System.Windows.Forms.SendKeys]::SendWait('${mapped}');"
+    fi
+  done
+
+  if [ "$PAUSE_BETWEEN" -gt 0 ] 2>/dev/null && [ "$r" -lt "$REPEAT" ]; then
+    PS_CMD+="Start-Sleep -Milliseconds ${PAUSE_BETWEEN};"
+  fi
+
+  # Pause between sequence keys
+  if [ ${#KEYS[@]} -gt 1 ] && [ "$PAUSE_BETWEEN" -gt 0 ] 2>/dev/null; then
+    : # already handled per-key if needed
+  fi
+done
+
+powershell.exe -Command "$PS_CMD"

@@ -1,0 +1,191 @@
+#!/bin/bash
+
+# Window control for WSL — list, focus, minimize, maximize windows by ID or title
+
+show_help() {
+  cat <<'HELP'
+Usage: winctl <command> [args]
+
+Commands:
+  list [FILTER]              List visible windows (optional title filter)
+  focus <ID|PATTERN>         Bring window to foreground by handle ID or title substring
+  minimize <ID|PATTERN>      Minimize a window
+  maximize <ID|PATTERN>      Maximize a window
+  restore <ID|PATTERN>       Restore a minimized/maximized window
+  close <ID|PATTERN>         Close a window (sends WM_CLOSE)
+  help                       Show this help
+
+ID is a numeric window handle. PATTERN is a case-insensitive substring match on the window title.
+If multiple windows match a pattern, the first match is used.
+
+Examples:
+  winctl list                   List all visible windows
+  winctl list notepad           List windows with "notepad" in the title
+  winctl focus 12345            Focus window with handle 12345
+  winctl focus notepad          Focus first window matching "notepad"
+  winctl minimize "Visual St"   Minimize VS Code
+  winctl close "Untitled"       Close window titled "Untitled..."
+HELP
+  exit 0
+}
+
+CMD="${1:-help}"
+ARG="$2"
+
+case "$CMD" in
+  list)
+    powershell.exe -Command "
+Add-Type @\"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Collections.Generic;
+public class WinList {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport(\"user32.dll\")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();
+  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+}
+\"@;
+\$fg = [WinList]::GetForegroundWindow();
+\$filter = '${ARG}'.ToLower();
+\$results = New-Object System.Collections.ArrayList;
+[WinList]::EnumWindows({
+  param(\$hwnd, \$lparam)
+  if ([WinList]::IsWindowVisible(\$hwnd)) {
+    \$len = [WinList]::GetWindowTextLength(\$hwnd);
+    if (\$len -gt 0) {
+      \$sb = New-Object System.Text.StringBuilder (\$len + 1);
+      [WinList]::GetWindowText(\$hwnd, \$sb, \$sb.Capacity) | Out-Null;
+      \$title = \$sb.ToString();
+      \$wpid = [uint32]0;
+      [WinList]::GetWindowThreadProcessId(\$hwnd, [ref]\$wpid) | Out-Null;
+      \$proc = '';
+      try { \$proc = (Get-Process -Id \$wpid -ErrorAction SilentlyContinue).ProcessName } catch {};
+      if (\$filter -eq '' -or \$title.ToLower().Contains(\$filter)) {
+        \$active = if (\$hwnd -eq \$fg) { '*' } else { ' ' };
+        \$results.Add([PSCustomObject]@{A=\$active; Handle=\$hwnd.ToInt64(); PID=\$wpid; Process=\$proc; Title=\$title}) | Out-Null;
+      }
+    }
+  }
+  return \$true
+}, [IntPtr]::Zero) | Out-Null;
+\$results | Format-Table @{L=' ';E={\$_.A};W=1}, @{L='Handle';E={\$_.Handle};W=12}, @{L='PID';E={\$_.PID};W=8}, @{L='Process';E={\$_.Process};W=20}, @{L='Title';E={\$_.Title}} -Wrap
+" | tr -d '\r'
+    ;;
+
+  focus|minimize|maximize|restore|close)
+    if [ -z "$ARG" ]; then
+      echo "Error: $CMD requires a window ID or title pattern" >&2
+      exit 1
+    fi
+
+    # Determine the ShowWindow constant or action
+    case "$CMD" in
+      focus)    SW_ACTION="SW_RESTORE_AND_FOCUS" ;;
+      minimize) SW_ACTION="SW_MINIMIZE" ;;
+      maximize) SW_ACTION="SW_MAXIMIZE" ;;
+      restore)  SW_ACTION="SW_RESTORE" ;;
+      close)    SW_ACTION="WM_CLOSE" ;;
+    esac
+
+    powershell.exe -Command "
+Add-Type @\"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinCtl {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport(\"user32.dll\")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport(\"user32.dll\")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+}
+\"@;
+\$target = '${ARG}';
+\$hwnd = [IntPtr]::Zero;
+
+# Try as numeric handle first
+if (\$target -match '^\d+\$') {
+  \$hwnd = [IntPtr]::new([long]\$target);
+} else {
+  # Search by title and process name
+  \$pattern = \$target.ToLower();
+  \$found = \$null;
+  \$windows = New-Object System.Collections.ArrayList;
+  [WinCtl]::EnumWindows({
+    param(\$h, \$l)
+    if ([WinCtl]::IsWindowVisible(\$h)) {
+      \$len = [WinCtl]::GetWindowTextLength(\$h);
+      if (\$len -gt 0) {
+        \$windows.Add(\$h) | Out-Null;
+      }
+    }
+    return \$true
+  }, [IntPtr]::Zero) | Out-Null;
+  foreach (\$w in \$windows) {
+    \$len = [WinCtl]::GetWindowTextLength(\$w);
+    \$sb = New-Object System.Text.StringBuilder (\$len + 1);
+    [WinCtl]::GetWindowText(\$w, \$sb, \$sb.Capacity) | Out-Null;
+    \$title = \$sb.ToString().ToLower();
+    \$wpid = [uint32]0;
+    [WinCtl]::GetWindowThreadProcessId(\$w, [ref]\$wpid) | Out-Null;
+    \$proc = '';
+    try { \$proc = (Get-Process -Id \$wpid -ErrorAction SilentlyContinue).ProcessName.ToLower() } catch {};
+    if (\$title.Contains(\$pattern) -or \$proc.Contains(\$pattern)) {
+      \$found = \$w;
+      break;
+    }
+  }
+  if (\$found -ne \$null) { \$hwnd = \$found }
+}
+
+if (\$hwnd -eq [IntPtr]::Zero -or \$hwnd -eq \$null) {
+  Write-Error \"No window found matching: \$target\";
+  exit 1;
+}
+
+\$action = '${SW_ACTION}';
+switch (\$action) {
+  'SW_RESTORE_AND_FOCUS' {
+    if ([WinCtl]::IsIconic(\$hwnd)) { [WinCtl]::ShowWindow(\$hwnd, 9) | Out-Null };
+    [WinCtl]::SetForegroundWindow(\$hwnd) | Out-Null;
+    Write-Host 'Focused';
+  }
+  'SW_MINIMIZE' {
+    [WinCtl]::ShowWindow(\$hwnd, 6) | Out-Null;
+    Write-Host 'Minimized';
+  }
+  'SW_MAXIMIZE' {
+    [WinCtl]::ShowWindow(\$hwnd, 3) | Out-Null;
+    Write-Host 'Maximized';
+  }
+  'SW_RESTORE' {
+    [WinCtl]::ShowWindow(\$hwnd, 9) | Out-Null;
+    Write-Host 'Restored';
+  }
+  'WM_CLOSE' {
+    [WinCtl]::SendMessage(\$hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null;
+    Write-Host 'Close sent';
+  }
+}
+" | tr -d '\r'
+    ;;
+
+  help|--help|-h)
+    show_help
+    ;;
+
+  *)
+    echo "Unknown command: $CMD. Use 'winctl help' for usage." >&2
+    exit 1
+    ;;
+esac
