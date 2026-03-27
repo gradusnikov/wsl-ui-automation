@@ -16,7 +16,7 @@ Four bash scripts that use PowerShell and Win32 APIs to capture screens, control
 
 Built and tested live — Claude Code autonomously:
 1. Navigated Chrome to Google, searched for a topic, and clicked the first result
-2. Explored a medical imaging application (BrainMagix), discovered its UI structure, navigated brain MRI slices, and identified pathology
+2. Explored a desktop application, discovered its UI structure, and navigated through it
 3. Typed text into Notepad with special characters (`a+b=c (100%) ~hello^ {world}`)
 
 All without manual window switching or focus management.
