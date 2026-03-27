@@ -36,7 +36,17 @@ screenshot -r 100,200,800,600         # capture region (X,Y,W,H)
 screenshot --scale 50                 # downscale 50%
 screenshot -d 3 -w                    # delay 3s, capture focused window
 screenshot --list                     # list available screens
+
+# Annotations — draw on screenshots to communicate visually
+screenshot -t app --arrow 100,200,300,150         # arrow from → to
+screenshot -t app --circle 500,300,40             # circle at (x,y) radius r
+screenshot -t app --highlight 200,100,400,80      # semi-transparent highlight box
+screenshot -t app --label 210,90 "Click here"     # text label with dark outline
+screenshot -t app --color yellow --arrow 0,0,50,50 # change color (red,green,blue,yellow,cyan,white)
+# Multiple annotations stack: --highlight ... --arrow ... --label ...
 ```
+
+IMPORTANT: Use annotations proactively when showing screenshots to the user. An arrow pointing at the relevant element is worth a paragraph of description.
 
 ### Mouse (`~/bin/mouse`)
 ```

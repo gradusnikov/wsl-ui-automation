@@ -13,10 +13,31 @@ SCALE=""
 OPEN_AFTER=false
 TITLE=""
 CROP=""
+ANNOTATIONS=()
 
 # Parse arguments — first positional arg (not starting with -) is the filename
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --arrow)
+      ANNOTATIONS+=("arrow:$2")
+      shift 2
+      ;;
+    --circle)
+      ANNOTATIONS+=("circle:$2")
+      shift 2
+      ;;
+    --highlight)
+      ANNOTATIONS+=("highlight:$2")
+      shift 2
+      ;;
+    --label)
+      ANNOTATIONS+=("label:$2:$3")
+      shift 3
+      ;;
+    --color)
+      ANNOTATIONS+=("color:$2")
+      shift 2
+      ;;
     --hide|-h)
       HIDE_WINDOW=true
       shift
@@ -95,6 +116,13 @@ Options:
   --open, -o          Open the image after saving
   --list, -l          List available screens
   --help              Show this help
+
+Annotations (can be repeated, drawn in order):
+  --arrow X1,Y1,X2,Y2       Draw arrow from (X1,Y1) to (X2,Y2)
+  --circle X,Y,R             Draw circle at (X,Y) with radius R
+  --highlight X,Y,W,H        Semi-transparent highlight rectangle
+  --label X,Y "text"         Text label at (X,Y)
+  --color NAME               Set color for subsequent annotations (red,green,blue,yellow,cyan,white)
 HELP
       exit 0
       ;;
@@ -278,6 +306,79 @@ if [ -n "$CROP" ]; then
 \$gc.Dispose();
 \$b.Dispose();
 \$b = \$cropped;"
+fi
+
+# Annotations
+if [ ${#ANNOTATIONS[@]} -gt 0 ]; then
+  PS_CMD+='
+$ag = [System.Drawing.Graphics]::FromImage($b);
+$ag.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias;
+$ag.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias;
+$acolor = [System.Drawing.Color]::Red;'
+
+  for ann in "${ANNOTATIONS[@]}"; do
+    TYPE="${ann%%:*}"
+    DATA="${ann#*:}"
+
+    case "$TYPE" in
+      color)
+        case "${DATA,,}" in
+          red)    PS_CMD+='$acolor = [System.Drawing.Color]::Red;' ;;
+          green)  PS_CMD+='$acolor = [System.Drawing.Color]::Lime;' ;;
+          blue)   PS_CMD+='$acolor = [System.Drawing.Color]::DodgerBlue;' ;;
+          yellow) PS_CMD+='$acolor = [System.Drawing.Color]::Yellow;' ;;
+          cyan)   PS_CMD+='$acolor = [System.Drawing.Color]::Cyan;' ;;
+          white)  PS_CMD+='$acolor = [System.Drawing.Color]::White;' ;;
+          *)      PS_CMD+='$acolor = [System.Drawing.Color]::Red;' ;;
+        esac
+        ;;
+      arrow)
+        IFS=',' read -r AX1 AY1 AX2 AY2 <<< "$DATA"
+        PS_CMD+="
+\$apen = New-Object System.Drawing.Pen(\$acolor, 3);
+\$apen.EndCap = [System.Drawing.Drawing2D.LineCap]::ArrowAnchor;
+\$apen.CustomEndCap = New-Object System.Drawing.Drawing2D.AdjustableArrowCap(8, 6, \$true);
+\$ag.DrawLine(\$apen, ${AX1}, ${AY1}, ${AX2}, ${AY2});
+\$apen.Dispose();"
+        ;;
+      circle)
+        IFS=',' read -r CRX CRY CRR <<< "$DATA"
+        PS_CMD+="
+\$apen = New-Object System.Drawing.Pen(\$acolor, 3);
+\$ag.DrawEllipse(\$apen, $((CRX - CRR)), $((CRY - CRR)), $((CRR * 2)), $((CRR * 2)));
+\$apen.Dispose();"
+        ;;
+      highlight)
+        IFS=',' read -r HX HY HW HH <<< "$DATA"
+        PS_CMD+="
+\$hbrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(80, \$acolor));
+\$ag.FillRectangle(\$hbrush, ${HX}, ${HY}, ${HW}, ${HH});
+\$hbrush.Dispose();
+\$apen = New-Object System.Drawing.Pen(\$acolor, 2);
+\$ag.DrawRectangle(\$apen, ${HX}, ${HY}, ${HW}, ${HH});
+\$apen.Dispose();"
+        ;;
+      label)
+        # DATA is "X,Y:text"
+        COORDS="${DATA%%:*}"
+        LTEXT="${DATA#*:}"
+        IFS=',' read -r LX LY <<< "$COORDS"
+        # Escape single quotes for PowerShell
+        LTEXT="${LTEXT//\'/\'\'}"
+        PS_CMD+="
+\$afont = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold);
+\$apath = New-Object System.Drawing.Drawing2D.GraphicsPath;
+\$apath.AddString('${LTEXT}', \$afont.FontFamily, [int]\$afont.Style, 22, (New-Object System.Drawing.Point(${LX}, ${LY})), [System.Drawing.StringFormat]::GenericDefault);
+\$ag.DrawPath((New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, 0, 0, 0), 4)), \$apath);
+\$ag.FillPath((New-Object System.Drawing.SolidBrush(\$acolor)), \$apath);
+\$afont.Dispose();
+\$apath.Dispose();"
+        ;;
+    esac
+  done
+
+  PS_CMD+='
+$ag.Dispose();'
 fi
 
 # Save

@@ -85,9 +85,21 @@ screenshot -t notepad --crop 0,0,800,600  # capture and crop Notepad
 screenshot --list                         # list available screens
 screenshot --hide -t chrome               # hide terminal, capture Chrome
 screenshot -o shot.png                    # open image after saving
+
+# Annotations — draw on screenshots
+screenshot -t chrome --arrow 200,350,400,200              # arrow from → to
+screenshot -t chrome --circle 500,300,40                   # circle at (x,y) radius r
+screenshot -t chrome --highlight 200,100,400,80            # semi-transparent highlight
+screenshot -t chrome --label 210,90 "Click here"           # text with dark outline
+screenshot -t chrome --color yellow --arrow 100,100,200,50 # change color
+# Colors: red (default), green, blue, yellow, cyan, white
+# Multiple annotations can be combined and are drawn in order
+screenshot -t app --highlight 50,50,300,100 --arrow 20,100,50,80 --label 20,115 "Here"
 ```
 
 **Key feature**: `--title` uses the `PrintWindow` API, which captures a window's content even when it's behind other windows. No need to focus or bring it to front.
+
+**Annotations**: Draw arrows, circles, highlights, and labels directly on screenshots. Useful for AI agents to visually communicate what they're seeing or pointing at.
 
 ### mouse
 
