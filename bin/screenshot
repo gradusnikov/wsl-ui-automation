@@ -14,6 +14,7 @@ OPEN_AFTER=false
 TITLE=""
 CROP=""
 ANNOTATIONS=()
+GRID=0
 
 # Parse arguments — first positional arg (not starting with -) is the filename
 while [[ $# -gt 0 ]]; do
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --color)
       ANNOTATIONS+=("color:$2")
+      shift 2
+      ;;
+    --grid)
+      GRID="${2:-100}"
       shift 2
       ;;
     --hide|-h)
@@ -123,6 +128,7 @@ Annotations (can be repeated, drawn in order):
   --highlight X,Y,W,H        Semi-transparent highlight rectangle
   --label X,Y "text"         Text label at (X,Y)
   --color NAME               Set color for subsequent annotations (red,green,blue,yellow,cyan,white)
+  --grid [N]                 Draw coordinate grid with N pixel spacing (default 100)
 HELP
       exit 0
       ;;
@@ -379,6 +385,43 @@ $acolor = [System.Drawing.Color]::Red;'
 
   PS_CMD+='
 $ag.Dispose();'
+fi
+
+# Grid overlay
+if [ "$GRID" -gt 0 ] 2>/dev/null; then
+  PS_CMD+="
+\$gg = [System.Drawing.Graphics]::FromImage(\$b);
+\$gg.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias;
+\$gg.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias;
+\$gpen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(100, 255, 0, 255), 1);
+\$gfont = New-Object System.Drawing.Font('Consolas', 9);
+\$gbg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(180, 0, 0, 0));
+\$gfg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(220, 255, 0, 255));
+\$spacing = ${GRID};
+\$offX = ${CROP:+${CROP%%,*}}${CROP:-0}; \$offY = 0;
+$(if [ -n "$CROP" ]; then
+  IFS=',' read -r _GCX _GCY _GCW _GCH <<< "$CROP"
+  echo "\$offX = ${_GCX}; \$offY = ${_GCY};"
+else
+  echo '$offX = 0; $offY = 0;'
+fi)
+\$startX = \$spacing - (\$offX % \$spacing); if (\$startX -eq \$spacing) { \$startX = 0 };
+\$startY = \$spacing - (\$offY % \$spacing); if (\$startY -eq \$spacing) { \$startY = 0 };
+for (\$gx = \$startX; \$gx -lt \$b.Width; \$gx += \$spacing) {
+  \$gg.DrawLine(\$gpen, \$gx, 0, \$gx, \$b.Height);
+  \$lbl = (\$gx + \$offX).ToString();
+  \$sz = \$gg.MeasureString(\$lbl, \$gfont);
+  \$gg.FillRectangle(\$gbg, \$gx + 2, 1, \$sz.Width, \$sz.Height);
+  \$gg.DrawString(\$lbl, \$gfont, \$gfg, (\$gx + 2), 1);
+}
+for (\$gy = \$startY; \$gy -lt \$b.Height; \$gy += \$spacing) {
+  \$gg.DrawLine(\$gpen, 0, \$gy, \$b.Width, \$gy);
+  \$lbl = (\$gy + \$offY).ToString();
+  \$sz = \$gg.MeasureString(\$lbl, \$gfont);
+  \$gg.FillRectangle(\$gbg, 1, \$gy + 2, \$sz.Width, \$sz.Height);
+  \$gg.DrawString(\$lbl, \$gfont, \$gfg, 1, (\$gy + 2));
+}
+\$gpen.Dispose(); \$gfont.Dispose(); \$gbg.Dispose(); \$gfg.Dispose(); \$gg.Dispose();"
 fi
 
 # Save

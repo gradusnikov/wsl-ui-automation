@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Crop images by coordinates, grid cells, or detection results.
+
+Usage:
+  imgcrop image.png 370,540,460,480                  Crop by X,Y,W,H
+  imgcrop image.png 370,540,460,480 -o cropped.png   Custom output path
+  imgcrop image.png --grid 3x3                       Split into 3x3 grid (saves cell_R_C.png)
+  imgcrop image.png --grid 3x3 --cell 1,2            Extract single grid cell [row,col]
+  imgcrop image.png --detect "chair"                 Crop to first YOLO detection
+  imgcrop image.png --detect "chair" --index 2       Crop to 2nd detection
+  imgcrop image.png --detect "chair" --all           Save all detections as separate files
+  imgcrop image.png --detect --coco                  Crop to first COCO detection
+  imgcrop image.png --ocr "Submit"                   Crop to OCR text match
+  imgcrop image.png --pad 10                         Add padding around crop (pixels)
+
+Default output: /tmp/crop.png (single) or /tmp/crop_N.png (multiple)
+"""
+import sys
+import os
+import json
+import argparse
+import subprocess
+import urllib.request
+from urllib.parse import urlencode
+
+YOLO_URL = "http://127.0.0.1:18201"
+OCR_URL = "http://127.0.0.1:18200"
+
+
+def server_running(url):
+    try:
+        req = urllib.request.Request(f"{url}/health", method="GET")
+        resp = urllib.request.urlopen(req, timeout=1)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def yolo_detect(image_path, classes=None, conf=0.15, coco=False):
+    with open(image_path, "rb") as f:
+        data = f.read()
+    mode = "coco" if coco else "auto"
+    params = {"conf": str(conf), "mode": mode}
+    if classes:
+        params["classes"] = classes
+    qs = urlencode(params)
+    req = urllib.request.Request(
+        f"{YOLO_URL}/detect?{qs}", data=data,
+        headers={"Content-Type": "application/octet-stream"}, method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    return json.loads(resp.read().decode())
+
+
+def ocr_find(image_path, query):
+    with open(image_path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        f"{OCR_URL}/ocr", data=data,
+        headers={"Content-Type": "application/octet-stream"}, method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    regions = json.loads(resp.read().decode())
+    q = query.lower()
+    matches = []
+    for r in regions:
+        t = r["text"].lower()
+        if q == t or q in t:
+            matches.append(r)
+    return matches
+
+
+def crop_and_save(img, x, y, w, h, output, pad=0):
+    import cv2
+    ih, iw = img.shape[:2]
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(iw, x + w + pad)
+    y2 = min(ih, y + h + pad)
+    cropped = img[y1:y2, x1:x2]
+    cv2.imwrite(output, cropped)
+    print(f"{output}  [{x1},{y1},{x2-x1},{y2-y1}]")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Crop images by coords, grid, or detection")
+    parser.add_argument("image", help="Input image path")
+    parser.add_argument("region", nargs="?", help="X,Y,W,H crop region")
+    parser.add_argument("-o", "--output", help="Output path (default: /tmp/crop.png)")
+    parser.add_argument("--grid", help="Split into NxM grid (e.g. 3x3)")
+    parser.add_argument("--cell", help="Extract specific grid cell: ROW,COL (0-based)")
+    parser.add_argument("--detect", nargs="?", const="", help="Crop to YOLO detection (optional: class names)")
+    parser.add_argument("--coco", action="store_true", help="Use COCO model for --detect")
+    parser.add_argument("--ocr", help="Crop to OCR text match")
+    parser.add_argument("--index", type=int, default=1, help="Which detection to crop (1-based, default: 1)")
+    parser.add_argument("--all", action="store_true", help="Save all detections/cells as separate files")
+    parser.add_argument("--pad", type=int, default=0, help="Padding around crop in pixels")
+    parser.add_argument("-c", "--conf", type=float, default=0.15, help="Detection confidence")
+    args = parser.parse_args()
+
+    import cv2
+    img = cv2.imread(args.image)
+    if img is None:
+        print(f"Error: cannot read {args.image}", file=sys.stderr)
+        sys.exit(2)
+
+    out = args.output or "/tmp/crop.png"
+
+    # Mode 1: Direct coordinates
+    if args.region:
+        x, y, w, h = [int(v) for v in args.region.split(",")]
+        crop_and_save(img, x, y, w, h, out, args.pad)
+        return
+
+    # Mode 2: Grid split
+    if args.grid:
+        cols, rows = [int(v) for v in args.grid.split("x")]
+        ih, iw = img.shape[:2]
+        cw, ch = iw // cols, ih // rows
+
+        if args.cell:
+            r, c = [int(v) for v in args.cell.split(",")]
+            crop_and_save(img, c * cw, r * ch, cw, ch, out, args.pad)
+        elif args.all:
+            base = os.path.splitext(out)[0]
+            ext = os.path.splitext(out)[1] or ".png"
+            for r in range(rows):
+                for c in range(cols):
+                    path = f"{base}_{r}_{c}{ext}"
+                    crop_and_save(img, c * cw, r * ch, cw, ch, path, args.pad)
+        else:
+            # Just print grid info
+            print(f"Grid {cols}x{rows}: cell size {cw}x{ch}")
+            for r in range(rows):
+                for c in range(cols):
+                    cx = c * cw + cw // 2
+                    cy = r * ch + ch // 2
+                    print(f"  [{r},{c}]  origin=({c*cw},{r*ch})  center=({cx},{cy})")
+        return
+
+    # Mode 3: YOLO detection crop
+    if args.detect is not None:
+        if not server_running(YOLO_URL):
+            print("YOLO server not running. Start with: detect --start", file=sys.stderr)
+            sys.exit(2)
+        classes = args.detect if args.detect else None
+        detections = yolo_detect(args.image, classes, args.conf, args.coco)
+        if not detections:
+            print("No detections found.", file=sys.stderr)
+            sys.exit(1)
+
+        if args.all:
+            base = os.path.splitext(out)[0]
+            ext = os.path.splitext(out)[1] or ".png"
+            for i, d in enumerate(detections):
+                path = f"{base}_{i}_{d['class']}{ext}"
+                x, y, w, h = d["bbox"]
+                crop_and_save(img, x, y, w, h, path, args.pad)
+        else:
+            idx = args.index - 1
+            if idx >= len(detections):
+                print(f"Only {len(detections)} detection(s), requested index {args.index}", file=sys.stderr)
+                sys.exit(1)
+            d = detections[idx]
+            x, y, w, h = d["bbox"]
+            print(f"{d['class']} {d['confidence']:.0%}", file=sys.stderr)
+            crop_and_save(img, x, y, w, h, out, args.pad)
+        return
+
+    # Mode 4: OCR text crop
+    if args.ocr:
+        if not server_running(OCR_URL):
+            print("OCR server not running. Start with: find_text --start", file=sys.stderr)
+            sys.exit(2)
+        matches = ocr_find(args.image, args.ocr)
+        if not matches:
+            print(f"Text not found: \"{args.ocr}\"", file=sys.stderr)
+            sys.exit(1)
+
+        if args.all:
+            base = os.path.splitext(out)[0]
+            ext = os.path.splitext(out)[1] or ".png"
+            for i, m in enumerate(matches):
+                path = f"{base}_{i}{ext}"
+                x, y, w, h = m["bbox"]
+                crop_and_save(img, x, y, w, h, path, args.pad)
+        else:
+            idx = args.index - 1
+            if idx >= len(matches):
+                print(f"Only {len(matches)} match(es), requested index {args.index}", file=sys.stderr)
+                sys.exit(1)
+            m = matches[idx]
+            x, y, w, h = m["bbox"]
+            print(f"\"{m['text']}\" {m['confidence']:.0%}", file=sys.stderr)
+            crop_and_save(img, x, y, w, h, out, args.pad)
+        return
+
+    parser.print_help()
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

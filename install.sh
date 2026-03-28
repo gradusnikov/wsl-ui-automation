@@ -9,7 +9,7 @@ BIN_DIR="${1:-$HOME/bin}"
 echo "Installing scripts to $BIN_DIR..."
 mkdir -p "$BIN_DIR"
 cp "$SCRIPT_DIR/bin/"* "$BIN_DIR/"
-chmod +x "$BIN_DIR/screenshot" "$BIN_DIR/sendkeys" "$BIN_DIR/mouse" "$BIN_DIR/winctl"
+chmod +x "$BIN_DIR/"*
 
 # Check if BIN_DIR is on PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
@@ -20,7 +20,20 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
 fi
 
 echo ""
-echo "Installed: screenshot, sendkeys, mouse, winctl"
+echo "Installed tools:"
+echo "  Low-level:  screenshot, mouse, sendkeys, winctl"
+echo "  OCR:        find_text, click_text, wait_for, read_screen"
+echo "  YOLO:       detect"
+echo "  Image:      imgcrop"
+echo "  Servers:    ocr_server.py, yolo_server.py"
+
+# Check Python dependencies
+echo ""
+echo "Checking Python dependencies..."
+python3 -c "import ultralytics, easyocr, torch, cv2" 2>/dev/null && echo "  All dependencies found." || {
+  echo "  Missing dependencies. Install with:"
+  echo "    pip install ultralytics easyocr torch torchvision opencv-python"
+}
 
 # Optionally install Claude Code skills
 if [ -d "$HOME/.claude" ]; then
@@ -34,4 +47,6 @@ if [ -d "$HOME/.claude" ]; then
 fi
 
 echo ""
-echo "Done! Try: winctl list"
+echo "Done! Start GPU servers with:"
+echo "  find_text --start    # OCR server :18200"
+echo "  detect --start       # YOLO server :18201"

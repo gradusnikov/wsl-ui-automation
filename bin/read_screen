@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""OCR a window/screen and return structured text with positions.
+
+Usage:
+  read_screen                              OCR the primary screen
+  read_screen --title chrome               OCR a specific window
+  read_screen --file image.png             OCR an image file
+  read_screen --title chrome --region 400,500,300,200   OCR a specific region
+  read_screen --title chrome --json        Output as JSON
+  read_screen --title chrome --text-only   Just the text, no coordinates
+
+Useful for: reading page content, extracting data from UI, verifying text.
+"""
+import sys
+import os
+import json
+import argparse
+import subprocess
+import urllib.request
+
+SERVER_URL = "http://127.0.0.1:18200"
+SCREENSHOT_BIN = os.path.expanduser("~/bin/screenshot")
+
+
+def server_is_running():
+    try:
+        req = urllib.request.Request(f"{SERVER_URL}/health", method="GET")
+        resp = urllib.request.urlopen(req, timeout=1)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def ocr_via_server(image_path):
+    with open(image_path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        f"{SERVER_URL}/ocr",
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    return json.loads(resp.read().decode())
+
+
+def ocr_direct(image_path):
+    import cv2
+    import easyocr
+
+    reader = easyocr.Reader(["pl", "en"], gpu=True, verbose=False)
+    image = cv2.imread(image_path)
+    results = reader.readtext(image)
+
+    regions = []
+    for bbox, text, conf in results:
+        xs = [int(p[0]) for p in bbox]
+        ys = [int(p[1]) for p in bbox]
+        x1, y1 = min(xs), min(ys)
+        x2, y2 = max(xs), max(ys)
+        regions.append({
+            "text": text,
+            "confidence": round(float(conf), 3),
+            "bbox": [x1, y1, x2 - x1, y2 - y1],
+            "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+        })
+    return regions
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OCR screen/window content")
+    parser.add_argument("-t", "--title", help="Window title/process to capture")
+    parser.add_argument("-f", "--file", help="Image file to OCR")
+    parser.add_argument("-r", "--region", help="Region to crop: X,Y,W,H (applied after capture)")
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+    parser.add_argument("--text-only", action="store_true", help="Output text only, sorted by position")
+    args = parser.parse_args()
+
+    # Capture
+    if args.file:
+        image_path = args.file
+    else:
+        image_path = "/tmp/_read_screen_capture.png"
+        cmd = [SCREENSHOT_BIN, image_path]
+        if args.title:
+            cmd += ["--title", args.title]
+        if args.region:
+            cmd += ["--crop", args.region]
+        subprocess.run(cmd, check=True, capture_output=True)
+
+    # OCR
+    if server_is_running():
+        regions = ocr_via_server(image_path)
+    else:
+        regions = ocr_direct(image_path)
+
+    # Sort by vertical position, then horizontal
+    regions.sort(key=lambda r: (r["center"][1], r["center"][0]))
+
+    if args.json:
+        print(json.dumps(regions, indent=2, ensure_ascii=False))
+    elif args.text_only:
+        # Group into lines by y-proximity
+        lines = []
+        current_line = []
+        last_y = None
+        for r in regions:
+            cy = r["center"][1]
+            if last_y is not None and abs(cy - last_y) > 15:
+                lines.append(current_line)
+                current_line = []
+            current_line.append(r)
+            last_y = cy
+        if current_line:
+            lines.append(current_line)
+        for line in lines:
+            line.sort(key=lambda r: r["center"][0])
+            print(" ".join(r["text"] for r in line))
+    else:
+        for r in regions:
+            cx, cy = r["center"]
+            print(f"  ({cx:4d},{cy:4d})  {r['confidence']:.2f}  \"{r['text']}\"")
+        print(f"\n{len(regions)} regions", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Find text on screen and click it. Combines OCR + mouse in one step.
+
+Usage:
+  click_text "Search"                        Click text on primary screen
+  click_text "Search" --title chrome         Click text in a specific window
+  click_text "Submit" --right                Right-click instead
+  click_text "Submit" --double               Double-click
+  click_text "Tab Name" --offset 0,-20       Click with pixel offset from text center
+  click_text "Search" --index 2              Click the 2nd match (1-based, default: 1)
+  click_text "Search" --dry-run              Find but don't click (just print coordinates)
+
+Exit codes: 0 = clicked, 1 = not found, 2 = error
+"""
+import sys
+import os
+import json
+import argparse
+import subprocess
+import urllib.request
+
+SERVER_URL = "http://127.0.0.1:18200"
+SCREENSHOT_BIN = os.path.expanduser("~/bin/screenshot")
+MOUSE_BIN = os.path.expanduser("~/bin/mouse")
+
+
+def server_is_running():
+    try:
+        req = urllib.request.Request(f"{SERVER_URL}/health", method="GET")
+        resp = urllib.request.urlopen(req, timeout=1)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def ocr_via_server(image_path):
+    with open(image_path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        f"{SERVER_URL}/ocr",
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    return json.loads(resp.read().decode())
+
+
+def ocr_direct(image_path):
+    import cv2
+    import easyocr
+
+    reader = easyocr.Reader(["pl", "en"], gpu=True, verbose=False)
+    image = cv2.imread(image_path)
+    results = reader.readtext(image)
+
+    regions = []
+    for bbox, text, conf in results:
+        xs = [int(p[0]) for p in bbox]
+        ys = [int(p[1]) for p in bbox]
+        x1, y1 = min(xs), min(ys)
+        x2, y2 = max(xs), max(ys)
+        regions.append({
+            "text": text,
+            "confidence": round(float(conf), 3),
+            "bbox": [x1, y1, x2 - x1, y2 - y1],
+            "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+        })
+    return regions
+
+
+def fuzzy_match(query, text):
+    q = query.lower()
+    t = text.lower()
+    if q == t:
+        return 1.0
+    if q in t:
+        return 0.9 * (len(q) / len(t))
+    qwords = q.split()
+    twords = t.split()
+    if len(qwords) > 1 and all(any(qw in tw for tw in twords) for qw in qwords):
+        return 0.7
+    return 0.0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Find and click text on screen")
+    parser.add_argument("query", help="Text to find and click")
+    parser.add_argument("-t", "--title", help="Target window title/process")
+    parser.add_argument("-f", "--file", help="Use image file instead of capturing")
+    parser.add_argument("--right", action="store_true", help="Right-click")
+    parser.add_argument("--double", action="store_true", help="Double-click")
+    parser.add_argument("--offset", help="X,Y offset from center (e.g. '0,-20')")
+    parser.add_argument("--index", type=int, default=1, help="Which match to click (1-based)")
+    parser.add_argument("--dry-run", action="store_true", help="Find only, don't click")
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+    args = parser.parse_args()
+
+    # Capture
+    if args.file:
+        image_path = args.file
+    else:
+        image_path = "/tmp/_click_text_capture.png"
+        cmd = [SCREENSHOT_BIN, image_path]
+        if args.title:
+            cmd += ["--title", args.title]
+        subprocess.run(cmd, check=True, capture_output=True)
+
+    # OCR
+    if server_is_running():
+        regions = ocr_via_server(image_path)
+    else:
+        regions = ocr_direct(image_path)
+
+    # Match
+    matches = []
+    for r in regions:
+        score = fuzzy_match(args.query, r["text"])
+        if score > 0:
+            matches.append({**r, "score": score})
+    matches.sort(key=lambda m: m["score"], reverse=True)
+
+    if not matches:
+        print(f"Not found: \"{args.query}\"", file=sys.stderr)
+        sys.exit(1)
+
+    if args.index > len(matches):
+        print(f"Only {len(matches)} match(es), requested index {args.index}", file=sys.stderr)
+        sys.exit(1)
+
+    target = matches[args.index - 1]
+    cx, cy = target["center"]
+
+    # Apply offset
+    if args.offset:
+        ox, oy = [int(v) for v in args.offset.split(",")]
+        cx += ox
+        cy += oy
+
+    if args.json:
+        print(json.dumps({"x": cx, "y": cy, "text": target["text"],
+                          "bbox": target["bbox"], "confidence": target["confidence"]}))
+    else:
+        print(f"{cx},{cy}  \"{target['text']}\"", file=sys.stderr)
+
+    if args.dry_run:
+        return
+
+    # Click
+    click_cmd = "dclick" if args.double else ("rclick" if args.right else "click")
+    cmd = [MOUSE_BIN, click_cmd, f"{cx},{cy}"]
+    if args.title:
+        cmd += ["--title", args.title]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+if __name__ == "__main__":
+    main()

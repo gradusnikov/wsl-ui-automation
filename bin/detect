@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Detect objects in screen/window/image using YOLO.
+
+Usage:
+  detect -t chrome                         Detect COCO objects in Chrome
+  detect -t chrome "chair,car,person"      Detect specific objects (YOLO-World)
+  detect -t chrome "button,icon,link"      Open-vocabulary detection
+  detect --file image.png "chair"          Detect in image file
+  detect -t chrome --list                  List COCO class names
+  detect -t chrome --vis                   Save annotated image to /tmp/detect_vis.png
+  detect --start                           Start YOLO server
+  detect --stop                            Stop YOLO server
+
+Options:
+  -t, --title PATTERN    Capture window matching pattern
+  -f, --file PATH        Use existing image file
+  -c, --conf FLOAT       Confidence threshold (default: 0.15)
+  -j, --json             JSON output
+  -v, --vis [PATH]       Save annotated image (default: /tmp/detect_vis.png)
+  --coco                 Force COCO model (80 fixed classes, faster)
+  --world                Force YOLO-World (open vocabulary)
+"""
+import sys
+import os
+import json
+import time
+import argparse
+import subprocess
+import urllib.request
+from urllib.parse import urlencode
+
+SERVER_URL = "http://127.0.0.1:18201"
+PID_FILE = "/tmp/yolo_server.pid"
+SCREENSHOT_BIN = os.path.expanduser("~/bin/screenshot")
+
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush",
+]
+
+
+def server_is_running():
+    try:
+        req = urllib.request.Request(f"{SERVER_URL}/health", method="GET")
+        resp = urllib.request.urlopen(req, timeout=1)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def detect_via_server(image_path, classes=None, conf=0.15, mode="auto"):
+    with open(image_path, "rb") as f:
+        data = f.read()
+    params = {"conf": str(conf), "mode": mode}
+    if classes:
+        params["classes"] = classes
+    qs = urlencode(params)
+    req = urllib.request.Request(
+        f"{SERVER_URL}/detect?{qs}",
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    return json.loads(resp.read().decode())
+
+
+def detect_direct(image_path, classes=None, conf=0.15, mode="auto"):
+    import cv2
+    from ultralytics import YOLOWorld, YOLO
+
+    image = cv2.imread(image_path)
+    detections = []
+
+    if classes and (mode in ("auto", "world")):
+        model = YOLOWorld("yolov8s-world.pt")
+        model.to("cuda" if __import__("torch").cuda.is_available() else "cpu")
+        class_list = [c.strip() for c in classes.split(",")]
+        model.set_classes(class_list)
+        results = model.predict(image, verbose=False, conf=conf)
+    else:
+        model = YOLO("yolov8s.pt")
+        model.to("cuda" if __import__("torch").cuda.is_available() else "cpu")
+        results = model.predict(image, verbose=False, conf=conf)
+
+    for r in results:
+        for box in r.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            detections.append({
+                "class": r.names[int(box.cls)],
+                "confidence": round(box.conf.item(), 3),
+                "bbox": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                "center": [int((x1 + x2) / 2), int((y1 + y2) / 2)],
+            })
+    detections.sort(key=lambda d: d["confidence"], reverse=True)
+    return detections
+
+
+def start_server():
+    print("Starting YOLO server...", file=sys.stderr)
+    subprocess.Popen(
+        [sys.executable, os.path.expanduser("~/bin/yolo_server.py")],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(60):
+        time.sleep(0.5)
+        if server_is_running():
+            print("Server ready.", file=sys.stderr)
+            return True
+    print("Server failed to start.", file=sys.stderr)
+    return False
+
+
+def stop_server():
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        try:
+            os.kill(pid, 15)
+            print(f"Stopped YOLO server (pid {pid})", file=sys.stderr)
+        except ProcessLookupError:
+            os.remove(PID_FILE)
+            print("Stale pid file removed.", file=sys.stderr)
+    else:
+        print("No server running.", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Detect objects on screen")
+    parser.add_argument("classes", nargs="?", help="Comma-separated classes (uses YOLO-World)")
+    parser.add_argument("-t", "--title", help="Window title/process to capture")
+    parser.add_argument("-f", "--file", help="Image file to detect in")
+    parser.add_argument("-c", "--conf", type=float, default=0.15, help="Confidence threshold")
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+    parser.add_argument("-v", "--vis", nargs="?", const="/tmp/detect_vis.png", help="Save annotated image")
+    parser.add_argument("--coco", action="store_true", help="Force COCO model")
+    parser.add_argument("--world", action="store_true", help="Force YOLO-World")
+    parser.add_argument("--list", action="store_true", help="List COCO classes")
+    parser.add_argument("--start", action="store_true", help="Start YOLO server")
+    parser.add_argument("--stop", action="store_true", help="Stop YOLO server")
+    parser.add_argument("--status", action="store_true", help="Check server status")
+    args = parser.parse_args()
+
+    if args.start:
+        if server_is_running():
+            print("Server already running.", file=sys.stderr)
+        else:
+            start_server()
+        return
+
+    if args.stop:
+        stop_server()
+        return
+
+    if args.status:
+        status = "running" if server_is_running() else "not running"
+        print(f"YOLO server is {status}.", file=sys.stderr)
+        return
+
+    if args.list:
+        for i, c in enumerate(COCO_CLASSES):
+            print(f"  {i:2d}  {c}")
+        return
+
+    # Capture
+    if args.file:
+        image_path = args.file
+    else:
+        image_path = "/tmp/_detect_capture.png"
+        cmd = [SCREENSHOT_BIN, image_path]
+        if args.title:
+            cmd += ["--title", args.title]
+        subprocess.run(cmd, check=True, capture_output=True)
+
+    # Detect
+    mode = "coco" if args.coco else ("world" if args.world else "auto")
+    t0 = time.time()
+    if server_is_running():
+        detections = detect_via_server(image_path, args.classes, args.conf, mode)
+    else:
+        detections = detect_direct(image_path, args.classes, args.conf, mode)
+    elapsed = time.time() - t0
+
+    if not detections:
+        print("No objects detected.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.vis:
+        import cv2
+        img = cv2.imread(image_path)
+        colors = [(0,255,0),(0,165,255),(0,255,255),(255,0,255),(255,255,0),(255,0,0)]
+        class_colors = {}
+        for d in detections:
+            cls = d["class"]
+            if cls not in class_colors:
+                class_colors[cls] = colors[len(class_colors) % len(colors)]
+            c = class_colors[cls]
+            x, y, w, h = d["bbox"]
+            cv2.rectangle(img, (x, y), (x+w, y+h), c, 2)
+            label = f"{cls} {d['confidence']:.0%}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(img, (x, y-th-6), (x+tw+4, y), c, -1)
+            cv2.putText(img, label, (x+2, y-4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+        cv2.imwrite(args.vis, img)
+        print(f"Saved: {args.vis}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(detections, indent=2))
+    else:
+        for d in detections:
+            cx, cy = d["center"]
+            x, y, w, h = d["bbox"]
+            print(f"  {d['class']:20s}  {d['confidence']:.2f}  center=({cx},{cy})  bbox=[{x},{y},{w},{h}]")
+        print(f"\n{len(detections)} detections in {elapsed*1000:.0f}ms", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

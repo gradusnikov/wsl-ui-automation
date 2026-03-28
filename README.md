@@ -1,252 +1,188 @@
 # WSL UI Automation Toolkit
 
-Give Claude Code (or any AI coding agent) **eyes and hands** on your Windows desktop from WSL.
+A comprehensive GUI automation toolkit for Windows applications from WSL2. Combines low-level input tools (screenshot, mouse, keyboard) with AI-powered vision (OCR via EasyOCR, object detection via YOLO) for intelligent UI interaction.
 
-Four bash scripts that use PowerShell and Win32 APIs to capture screens, control the mouse, send keyboard input, and manage windows — all from the WSL command line. Includes Claude Code skills (slash commands) for seamless AI-driven UI automation.
+## Architecture
 
-## What can it do?
-
-- **See** the screen or any window (even behind other windows)
-- **Click** buttons, links, and UI elements by coordinates
-- **Type** text into any application
-- **Manage** windows — list, focus, minimize, maximize, close
-- **Automate** UI testing with a vision-action loop
-
-## Demo
-
-Built and tested live — Claude Code autonomously:
-1. Navigated Chrome to Google, searched for a topic, and clicked the first result
-2. Explored a desktop application, discovered its UI structure, and navigated through it
-3. Typed text into Notepad with special characters (`a+b=c (100%) ~hello^ {world}`)
-
-All without manual window switching or focus management.
-
-## Installation
-
-### Scripts
-
-Copy the scripts to a directory on your `$PATH`:
-
-```bash
-cp bin/* ~/bin/
-chmod +x ~/bin/screenshot ~/bin/sendkeys ~/bin/mouse ~/bin/winctl
+```
+┌─────────────────────────────────────────────────────────┐
+│  High-level tools                                       │
+│                                                         │
+│  Text interaction          Object detection             │
+│  click_text · find_text    detect (YOLO-World + COCO)   │
+│  wait_for · read_screen                                 │
+│         │                          │                    │
+│   ┌─────┴─────┐             ┌──────┴──────┐             │
+│   │ OCR Server │             │ YOLO Server │             │
+│   │ :18200     │             │ :18201      │             │
+│   │ EasyOCR    │             │ ~15ms/image │             │
+│   │ ~1.5s/scan │             └─────────────┘             │
+│   └───────────┘                                         │
+├─────────────────────────────────────────────────────────┤
+│  Low-level tools (direct Windows API via PowerShell)    │
+│  screenshot · mouse · sendkeys · winctl                 │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### Claude Code Skills (optional)
+## Setup
 
-Copy the skill files to make them available as slash commands in Claude Code:
+### Prerequisites
+- WSL2 with GPU passthrough (NVIDIA)
+- Python 3.10+
+- PowerShell (Windows side, called from WSL)
+
+### Installation
 
 ```bash
-# Global (all projects)
+# Copy tools to ~/bin/ (must be in PATH)
+cp screenshot mouse sendkeys winctl find_text click_text wait_for read_screen detect ~/bin/
+cp ocr_server.py yolo_server.py ~/bin/
+
+# Install Python dependencies
+pip install ultralytics easyocr torch torchvision opencv-python
+
+# YOLO models auto-download on first use: yolov8s.pt (21MB), yolov8s-world.pt (26MB)
+
+# Copy Claude Code skills (optional, for /ui slash command)
 cp skills/*.md ~/.claude/commands/
-
-# Or per-project
-cp skills/*.md .claude/commands/
 ```
 
-### Permissions (recommended)
+### Start GPU servers
 
-Add to your `.claude/settings.local.json` to avoid permission prompts:
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "Bash(~/bin/screenshot:*)",
-      "Bash(~/bin/sendkeys:*)",
-      "Bash(~/bin/winctl:*)",
-      "Bash(~/bin/mouse:*)",
-      "Bash(sleep:*)",
-      "Bash(powershell.exe:*)"
-    ]
-  }
-}
+```bash
+find_text --start         # OCR server on :18200 (~5s to load, then ~1.5s/scan)
+detect --start            # YOLO server on :18201 (~3s to load, then ~15ms/detect)
 ```
 
 ## Tools
 
-### screenshot
+### Low-level: Direct Windows API
 
-Capture the screen, a specific window, or a region.
+| Tool | Purpose | Example |
+|------|---------|---------|
+| `screenshot` | Capture screen/window | `screenshot /tmp/s.png -t chrome` |
+| `mouse` | Click, drag, scroll | `mouse click 500,300 -t chrome` |
+| `sendkeys` | Type text, press keys | `sendkeys -t app "hello"` |
+| `winctl` | Manage windows | `winctl focus chrome` |
 
+All support `--title`/`-t` for targeting specific windows by title/process name.
+
+### High-level: OCR-powered (text interaction)
+
+| Tool | Purpose | Example |
+|------|---------|---------|
+| `click_text` | Find text + click | `click_text "Submit" -t chrome` |
+| `find_text` | Find text position | `find_text "Search" -t chrome` |
+| `wait_for` | Wait for text to appear/disappear | `wait_for "Done" -t chrome` |
+| `read_screen` | OCR all text on screen | `read_screen -t chrome --text-only` |
+
+### High-level: YOLO-powered (object detection)
+
+| Tool | Purpose | Example |
+|------|---------|---------|
+| `detect` | Find objects by class name | `detect -t chrome "chair,car"` |
+| `detect --coco` | Detect 80 COCO classes | `detect -t chrome --coco` |
+
+**YOLO-World** accepts any text description (open vocabulary, no training needed).
+**YOLO COCO** is faster and more reliable for its 80 fixed classes (person, car, chair, etc.).
+
+## Usage patterns
+
+### Click a button by its label
 ```bash
-screenshot                                # primary screen -> /tmp/screenshot.png
-screenshot shot.png                       # custom filename
-screenshot -t chrome                      # capture Chrome (works even if behind other windows)
-screenshot -w                             # capture the focused window
-screenshot -s 1                           # capture second monitor
-screenshot -a                             # all monitors stitched together
-screenshot -c                             # save clipboard image to file
-screenshot -r 100,200,800,600             # capture region (X,Y,W,H)
-screenshot --crop 0,0,500,400             # crop after capture
-screenshot --scale 50                     # downscale by 50%
-screenshot -d 3 -w                        # delay 3 seconds, then capture
-screenshot -t notepad --crop 0,0,800,600  # capture and crop Notepad
-screenshot --list                         # list available screens
-screenshot --hide -t chrome               # hide terminal, capture Chrome
-screenshot -o shot.png                    # open image after saving
-
-# Annotations — draw on screenshots
-screenshot -t chrome --arrow 200,350,400,200              # arrow from → to
-screenshot -t chrome --circle 500,300,40                   # circle at (x,y) radius r
-screenshot -t chrome --highlight 200,100,400,80            # semi-transparent highlight
-screenshot -t chrome --label 210,90 "Click here"           # text with dark outline
-screenshot -t chrome --color yellow --arrow 100,100,200,50 # change color
-# Colors: red (default), green, blue, yellow, cyan, white
-# Multiple annotations can be combined and are drawn in order
-screenshot -t app --highlight 50,50,300,100 --arrow 20,100,50,80 --label 20,115 "Here"
+click_text "Submit" -t chrome
 ```
 
-**Key feature**: `--title` uses the `PrintWindow` API, which captures a window's content even when it's behind other windows. No need to focus or bring it to front.
-
-**Annotations**: Draw arrows, circles, highlights, and labels directly on screenshots. Useful for AI agents to visually communicate what they're seeing or pointing at.
-
-### mouse
-
-Move, click, drag, and scroll.
-
+### Fill a form
 ```bash
-mouse pos                           # print current cursor position (X,Y)
-mouse move 500,300                  # move cursor to position
-mouse click 500,300                 # left click at position
-mouse click                         # left click at current position
-mouse rclick 500,300                # right click
-mouse mclick 500,300                # middle click
-mouse dclick 200,100                # double click
-mouse drag 100,200 500,300          # drag from (100,200) to (500,300)
-mouse scroll down 5                 # scroll down 5 notches
-mouse scroll up                     # scroll up 3 notches (default)
-mouse scroll left 3                 # horizontal scroll
-mouse hold 100,200                  # press and hold left button
-mouse release 500,300               # release at position
-mouse click 50,80 -t notepad        # click relative to Notepad's top-left
-mouse -d 2 click 500,300            # wait 2 seconds, then click
+click_text "Username" -t chrome --offset 200,0    # click input right of label
+sendkeys -t chrome "myuser"
+sendkeys -t chrome --key tab
+sendkeys -t chrome "mypassword"
+click_text "Sign In" -t chrome
 ```
 
-**Key feature**: `--title` makes coordinates relative to the target window's top-left corner, so positions from screenshots map directly to click coordinates.
-
-### sendkeys
-
-Send keyboard events to any window.
-
+### Wait for page load
 ```bash
-sendkeys "Hello World"                    # type text (uses clipboard paste)
-sendkeys --key enter                      # press Enter
-sendkeys --key ctrl+s                     # key combination
-sendkeys --key ctrl+shift+s              # multi-modifier combo
-sendkeys --key alt+f4                     # close window
-sendkeys --keys "tab,tab,enter"           # key sequence
-sendkeys -r 5 --key tab                   # press Tab 5 times
-sendkeys -r 3 -p 500 --key down           # Down 3x, 500ms apart
-sendkeys -d 2 --key enter                 # delay 2 seconds, then press Enter
-sendkeys -t notepad "Hello World"         # focus Notepad, then type
-sendkeys -t chrome --key ctrl+l           # focus Chrome address bar
-sendkeys --key win+d                      # show desktop (Win key combos)
+sendkeys -t chrome --key ctrl+l
+sendkeys -t chrome "https://example.com"
+sendkeys -t chrome --key enter
+wait_for "Welcome" -t chrome --timeout 10
 ```
 
-**Key feature**: Text input uses clipboard paste (Ctrl+V), which correctly handles all special characters (`+`, `^`, `%`, `~`, `()`, `{}`, etc.) without SendKeys escaping issues. The original clipboard is saved and restored.
-
-**Supported keys**: enter, tab, escape/esc, backspace/bs, delete/del, space, up, down, left, right, home, end, pageup/pgup, pagedown/pgdn, f1-f12, insert/ins, capslock, numlock, scrolllock
-
-**Modifiers**: ctrl, alt, shift, win (combine with `+`)
-
-### winctl
-
-List and manage Windows GUI windows.
-
+### Read page content
 ```bash
-winctl list                         # list all visible windows
-winctl list chrome                  # filter by title or process name
-winctl focus notepad                # bring Notepad to foreground
-winctl focus 12345                  # focus by window handle
-winctl minimize eclipse             # minimize a window
-winctl maximize chrome              # maximize
-winctl restore notepad              # restore minimized window
-winctl close "Untitled"             # close window (sends WM_CLOSE)
+read_screen -t chrome --text-only          # text grouped by lines
+read_screen -t chrome --json               # full JSON with positions
+read_screen -t chrome -r 0,0,500,200       # OCR specific region only
 ```
 
-Output includes window handle, PID, process name, and title. The active window is marked with `*`.
-
-## Claude Code Skills
-
-The skills turn these tools into slash commands with natural language parsing:
-
-| Skill | Command | Description |
-|---|---|---|
-| `/screenshot` | `/screenshot chrome` | Capture and analyze a window |
-| `/mouse` | `/mouse click 200,50 to notepad` | Mouse control with targeting |
-| `/sendkeys` | `/sendkeys to chrome ctrl+t` | Keyboard input to any window |
-| `/winctl` | `/winctl list` | Window management |
-| `/ui` | `/ui look at chrome` | Unified reference — interprets intent |
-
-The `/ui` skill is a meta-skill that documents the full workflow and helps the AI choose the right tool.
-
-## Vision-Action Loop Pattern
-
-The core pattern for AI-driven UI automation:
-
+### Detect objects
 ```bash
-# 1. See — capture the target window
-screenshot /tmp/s.png -t myapp
-
-# 2. Get dimensions (screenshot pixels = window coordinates)
-powershell.exe -Command "
-  Add-Type -AssemblyName System.Drawing
-  \$i = [System.Drawing.Image]::FromFile('$(wslpath -w /tmp/s.png)')
-  Write-Host \"\$(\$i.Width)x\$(\$i.Height)\""
-
-# 3. Act — click, type, scroll based on what you see
-mouse click 200,350 -t myapp
-sendkeys -t myapp "search query"
-sendkeys -t myapp --key enter
-
-# 4. Verify — screenshot again
-screenshot /tmp/s.png -t myapp
+detect -t chrome                          # detect COCO objects (80 classes)
+detect -t chrome "chair,car,person"       # detect specific objects (YOLO-World)
+detect -t chrome "button,icon,link"       # open-vocabulary detection
+detect --file image.png "chair" -c 0.3    # detect in file, confidence 0.3
+detect -t chrome --coco -j                # COCO detection, JSON output
+detect --list                             # list all 80 COCO class names
+detect --start / --stop / --status        # manage YOLO server
 ```
 
-### Browser Automation Example
-
+### Navigate browser
 ```bash
-# Navigate to a URL
-sendkeys -t chrome --key ctrl+l           # focus address bar
-sendkeys -t chrome "https://example.com"  # type URL
-sendkeys -t chrome --key enter            # go
-sleep 2                                    # wait for page load
-
-# Interact with the page
-screenshot /tmp/s.png -t chrome            # see the page
-mouse click 300,400 -t chrome              # click an element
-sendkeys -t chrome "form input"            # type into a field
-screenshot /tmp/s.png -t chrome            # verify
+sendkeys -t chrome --key ctrl+l            # focus address bar
+sendkeys -t chrome "https://example.com"
+sendkeys -t chrome --key enter
 ```
 
-## Requirements
+## When to use what
 
-- **WSL** (Windows Subsystem for Linux) — WSL2 recommended
-- **PowerShell** — available via `powershell.exe` from WSL (ships with Windows)
-- **Bash** — any modern bash (zsh compatible)
+| Task | Best tool | Speed |
+|------|-----------|-------|
+| Click a button/link with visible text | `click_text` | ~2s |
+| Detect real-world objects (chair, car) | `detect` | ~15ms |
+| Detect arbitrary objects by description | `detect "description"` | ~15ms |
+| Click a specific pixel coordinate | `mouse click` | instant |
+| Type text into focused field | `sendkeys` | instant |
+| Wait for async operation | `wait_for` | ~2s/poll |
+| Read all text on page | `read_screen` | ~1.5s |
+| Find position of text without clicking | `find_text` | ~1.5s |
+| Take a screenshot to look at | `screenshot` | ~0.3s |
 
-No additional dependencies. The scripts use PowerShell's `Add-Type` to call Win32 APIs directly.
+### Decision tree
+- **"Click the Submit button"** → `click_text` (text-based)
+- **"Find all chairs in this image"** → `detect "chair"` (object detection)
+- **"What's on screen?"** → `read_screen` (text) or `detect --coco` (objects)
 
-## How It Works
+## Performance
 
-| Feature | API |
-|---|---|
-| Window capture (behind other windows) | `PrintWindow` via user32.dll |
-| Screen capture | `Graphics.CopyFromScreen` (.NET) |
-| Window enumeration & management | `EnumWindows`, `SetForegroundWindow`, `ShowWindow` |
-| Mouse control | `SetCursorPos`, `mouse_event` |
-| Keyboard (special keys) | `SendKeys.SendWait` (.NET) |
-| Keyboard (text) | Clipboard + `SendKeys('^v')` |
-| Window-relative coordinates | `GetWindowRect` offset calculation |
+With GPU servers running (RTX 4080):
 
-## Limitations
+| Operation | Time | Server port |
+|-----------|------|-------------|
+| Screenshot capture | ~0.3s | — |
+| **YOLO detection** | **~15ms** | :18201 |
+| OCR scan (1294x1399) | ~1.5s | :18200 |
+| `click_text` end-to-end | ~2s | :18200 |
+| `wait_for` per poll | ~2s | :18200 |
 
-- **Text input via clipboard**: `sendkeys` temporarily uses the clipboard for text. The original content is saved and restored, but rapid concurrent clipboard use could conflict.
-- **Window matching**: `--title` matches by case-insensitive substring against both window title and process name. If multiple windows match, the first found is used.
-- **DPI scaling**: Coordinates are in physical screen pixels. On high-DPI displays with scaling, PrintWindow captures at full resolution — screenshot dimensions match mouse coordinates directly.
-- **Focus for keyboard**: `sendkeys --title` must bring the window to the foreground to send keys. `screenshot --title` does NOT need focus (uses PrintWindow).
+Without servers (cold start), add ~3-5s for model loading.
 
-## License
+## Claude Code integration
 
-MIT
+The `skills/` directory contains Claude Code slash commands:
+- `/ui` — unified reference for all tools
+- `/screenshot` — capture and view screenshots
+- `/mouse` — mouse control
+- `/sendkeys` — keyboard input
+- `/winctl` — window management
+
+Copy to `~/.claude/commands/` to enable.
+
+## Design decisions
+
+- **OCR for text, YOLO for objects**: OCR finds text labels (buttons, links). YOLO detects and classifies visual objects in 15ms. Each excels at a different task — combining them covers both text-based UI and visual content.
+- **YOLO-World for open vocabulary**: Detects arbitrary objects by text description without training — "find all chairs" just works. COCO model is faster for its 80 fixed classes.
+- **Persistent GPU servers**: Model loading takes 3-5s. Two servers (OCR :18200, YOLO :18201) stay warm and respond in milliseconds to seconds.
+- **Window-relative coordinates**: `--title` flag on all tools makes coordinates independent of window position. PrintWindow API captures even occluded windows.
+- **EasyOCR over Tesseract**: Better out-of-the-box accuracy for mixed languages (Polish + English), GPU-accelerated, no system package dependency.
