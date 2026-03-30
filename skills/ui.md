@@ -1,5 +1,5 @@
 ---
-description: UI automation — interact with Windows GUI apps using screenshot, mouse, sendkeys, and winctl. Use for UI testing, browser automation, clicking buttons, filling forms, or any visual interaction.
+description: UI automation — interact with Windows GUI apps using som, gridzoom, mouse, sendkeys, and winctl. Use for UI testing, browser automation, clicking buttons, filling forms, or any visual interaction.
 ---
 
 # UI Automation
@@ -10,17 +10,16 @@ You have a full Windows GUI automation toolkit at `~/bin/`. Use it to see, click
 
 | Tool | Purpose | Notes |
 |---|---|---|
-| **screenshot** | Capture screen or window | PrintWindow API, works even if occluded |
+| **som** | Set-of-Marks: detect + number all elements | **Default tool** — see everything, pick by ID |
+| **click_text** | OCR + click in one command | When you already know the exact text label |
+| **find_text** | OCR: find text position on screen | Returns coordinates for clicking |
+| **read_screen** | OCR all text from window | Structured output, position-sorted |
+| **wait_for** | Poll until text appears/disappears | For async UI, page loads, spinners |
+| **gridzoom** | Hierarchical grid navigation + SAM | Chess coords → pixel-perfect clicks |
+| **detect** | YOLO object detection (open vocab) | ~15ms, "find chairs", "find buttons" |
 | **mouse** | Move, click, drag, scroll | Window-relative coordinates with `--title` |
 | **sendkeys** | Keyboard input (keys and text) | Clipboard paste for text, SendKeys for hotkeys |
 | **winctl** | List, focus, min/max/close windows | Title/process substring match |
-| **find_text** | OCR: find text position on screen | Returns coordinates for clicking |
-| **click_text** | OCR + click in one command | Best way to click UI elements by label |
-| **wait_for** | Poll until text appears/disappears | For async UI, page loads, spinners |
-| **read_screen** | OCR all text from window | Structured output, position-sorted |
-| **detect** | YOLO object detection (open vocab) | ~15ms, "find chairs", "find buttons" |
-| **som** | Set-of-Marks: detect + number all elements | Pick element by ID |
-| **gridzoom** | Hierarchical grid navigation + SAM | Chess coords → pixel-perfect clicks |
 
 ### GPU servers
 
@@ -36,77 +35,70 @@ All run on GPU (RTX 4080). **Start servers before interactive sessions.**
 
 ## Core workflow: tools-first, not vision-first
 
-**IMPORTANT: Your visual coordinate estimation is unreliable (~50-125px error). Never estimate pixel positions from screenshots. Always use tools for precision.**
+**IMPORTANT: Never estimate pixel positions from screenshots. Never use screenshot crops to locate elements. Always use the targeting tools below.**
 
-### Targeting strategy — from lightweight to precise:
+### Targeting strategy — always start with som:
 
-1. **Has text?** → `click_text "Label" -t app` (OCR, ~2s, highest confidence)
-2. **Is a known object?** → `detect -t app "object"` (YOLO, ~15ms)
-3. **Need to see all elements?** → `som mark -t app` then `som click N -t app` (OCR + numbering)
-4. **No text, no detectable object?** → `gridzoom capture -t app` → `gridzoom zoom D4` → `gridzoom click B5 -t app` (grid navigation)
-5. **Grid cell not centered on target?** → `gridzoom refine B5 -t app` (SAM segmentation → exact centroid)
+1. **Start here →** `som mark -t app` — see ALL elements numbered, pick by ID. This is your default.
+2. **Know the exact label?** → `click_text "Label" -t app` — shortcut when you're certain of the text
+3. **Element has no text?** → `gridzoom capture -t app` → `gridzoom zoom D4` → `gridzoom click B5 -t app`
+4. **Need sub-cell precision?** → `gridzoom refine B5 -t app` — SAM segmentation → exact centroid
+5. **Is a known object class?** → `detect -t app "object"` — YOLO, ~15ms
 
-### gridzoom quick reference
+### Do NOT:
+- Use `screenshot` — use `som mark` to see the UI (it captures a screenshot internally and gives you both marked + clean images)
+- Estimate pixel coordinates visually — always use a tool
+- Default to `click_text` before understanding the UI — use `som mark` first to see what's there
 
-```bash
-gridzoom capture -t chrome           # one hi-res grab, 10x10 grid
-gridzoom zoom D4                     # 3x3 window around D4 (default +1 padding)
-gridzoom zoom D4+2                   # 5x5 window (wider context)
-gridzoom click B5 -t chrome          # resolve cell → click
-gridzoom refine B5 -t chrome         # SAM segment → centroid → click
-gridzoom resolve B5                  # just print screen coordinates
-```
+## som — Set-of-Marks
 
-**Key patterns:**
-- Capture once per session — grid coords are stable, reuse them for all clicks
-- Use `screenshot` for quick peeks between clicks (don't re-capture gridzoom)
-- Zoom produces both `_grid.png` (labeled) and `_clean.png` (raw) — read clean for visual judgment, grid for cell reference
-- Output includes coordinate map: `A1=65,70  B1=194,70  ...` for every cell
-
-### som quick reference
+Detects all text elements on screen, numbers them with visual markers. You read the annotated image, pick a number, click it.
 
 ```bash
 som mark -t chrome                   # detect all text elements, number them
+# Read /tmp/som/screen_marked.png to see numbered elements
+# Read /tmp/som/screen_clean.png for clean view
 som click 17 -t chrome               # click element #17
 ```
 
-### Do NOT:
-- Take a screenshot and try to estimate pixel coordinates from it
-- Use `screenshot` when `read_screen` would give you the information you need
-- Crop → read → crop → read in loops. Use OCR tools instead.
+**When to use:** When you need an overview of all clickable elements, or when you're not sure which text label to target.
 
-### Standard interaction patterns:
+## gridzoom — Hierarchical Grid Navigation
 
-**Click a button/link:**
+Single capture, pure image manipulation zooms, chess-style coordinates with affine transform tracking. **Labels encode zoom depth** so you always know which level you're on.
+
 ```bash
-click_text "Submit" -t chrome              # one step, exact coordinates
+gridzoom capture -t chrome           # one hi-res grab, 5x5 grid (A1..E5)
+gridzoom zoom C3                     # zoom to single cell C3
+gridzoom zoom [B2,D4]                # zoom to region B2..D4 (3x3 cells)
+gridzoom zoom [A1,E2]                # zoom to top half (5x2 cells)
+gridzoom click B3 -t chrome          # resolve cell → click
+gridzoom refine B3 -t chrome         # SAM segment → centroid → click (most precise)
+gridzoom resolve B3                  # just print screen coordinates
+gridzoom clean                       # remove session files
 ```
 
-**Read what's on screen:**
-```bash
-read_screen -t chrome --text-only          # OCR all text, no screenshot needed
-```
+**Depth-aware labels:** Cell labels encode the zoom depth so you always know which level you're operating at. Format: `{column}{depth}{row}` — the depth digit is omitted at depth 0.
 
-**Explore an unfamiliar app:**
-```bash
-read_screen -t app --text-only             # understand the UI via text
-click_text "Menu Item" -t app              # navigate by clicking text labels
-read_screen -t app --text-only             # read what changed
-```
+| Depth | Labels | Color | Example |
+|-------|--------|-------|---------|
+| 0 | `A1..E5` | Yellow | `gridzoom zoom C3` |
+| 1 | `A11..E15` | Cyan | `gridzoom zoom [C12,D12]` |
+| 2 | `A21..E25` | Magenta | `gridzoom zoom A23` |
+| 3 | `A31..E35` | Green | `gridzoom click B32` |
 
-**Click near a label (e.g., input field next to label):**
-```bash
-click_text "Username" -t chrome --offset 200,0    # click 200px right of label
-```
-
-**Visual verification (show user what happened):**
-```bash
-screenshot /tmp/s.png -t app               # only when user needs to SEE the result
-```
+**Key patterns:**
+- **Capture once** per session — grid coords are stable, reuse them for all clicks
+- **Range zoom `[X,Y]`** — specify two corner cells to zoom into any rectangular region
+- **Read the grid image** to see which cell contains what, then choose your zoom target. The labels on each cell tell you exactly what to reference.
+- Zoom produces both `_grid.png` (labeled) and `_clean.png` (raw) — **read grid for cell reference, clean for visual judgment**
+- Output includes coordinate map: `A1=129,140  B1=388,140  ...` for every cell
+- Use `gridzoom refine` when a grid cell center doesn't land on the target — SAM finds the actual object centroid
+- To zoom from a specific parent level (not the latest), pass the image ID: `gridzoom zoom <ID> [B12,D13]`
 
 ## Quick reference
 
-### click_text (`~/bin/click_text`) — PRIMARY tool for clicking UI elements
+### click_text — PRIMARY tool for clicking UI elements
 ```bash
 click_text "Search" -t chrome              # find and click text
 click_text "Submit" -t chrome --right      # right-click
@@ -116,219 +108,122 @@ click_text "Save" -t chrome --index 2      # click 2nd occurrence
 click_text "Save" -t chrome --dry-run      # find only, print coordinates
 ```
 
-### find_text (`~/bin/find_text`) — find text coordinates without clicking
+### find_text — find text coordinates without clicking
 ```bash
 find_text "Search" -t chrome               # best match: "X,Y  text  bbox=..."
 find_text "Search" -t chrome -a            # all matches
 find_text --list -t chrome                 # list all detected text
 find_text --list -t chrome -j              # JSON output
-find_text --list -t chrome --vis           # save annotated image with all text boxes
-find_text "Search" -t chrome --vis         # annotated image highlighting matches
 find_text --start                          # start OCR server
 find_text --stop                           # stop OCR server
 ```
 
-### wait_for (`~/bin/wait_for`) — wait for UI state changes
+### wait_for — wait for UI state changes
 ```bash
 wait_for "Loading complete" -t chrome      # wait until text appears (15s timeout)
 wait_for "Loading..." -t chrome --gone     # wait until text disappears
 wait_for "Ready" -t chrome --timeout 30    # custom timeout
-wait_for "Ready" -t chrome --interval 0.5  # poll every 0.5s
 ```
 
-### read_screen (`~/bin/read_screen`) — read all text from UI
+### read_screen — read all text from UI
 ```bash
-read_screen -t chrome                      # all text with positions
 read_screen -t chrome --text-only          # just text, line-grouped
 read_screen -t chrome --json               # full JSON with bboxes
-read_screen -t chrome -r 400,500,300,200   # OCR a specific region only
 ```
 
-### screenshot (`~/bin/screenshot`)
+### mouse
 ```bash
-screenshot /tmp/s.png                      # primary screen
-screenshot /tmp/s.png -t chrome            # Chrome window (works even if occluded)
-screenshot /tmp/s.png -w                   # focused/foreground window
-screenshot /tmp/s.png -a                   # all monitors stitched
-screenshot /tmp/s.png -c                   # clipboard image
-screenshot /tmp/s.png -t app --crop X,Y,W,H  # capture + crop (post-capture)
-screenshot /tmp/s.png --scale 50           # downscale 50%
-screenshot /tmp/s.png -d 3 -w             # delay 3s before capture
-
-# Annotations — draw on screenshots to communicate visually
-screenshot /tmp/s.png -t app --arrow 100,200,300,150
-screenshot /tmp/s.png -t app --circle 500,300,40
-screenshot /tmp/s.png -t app --highlight 200,100,400,80
-screenshot /tmp/s.png -t app --label 210,90 "Click here"
-screenshot /tmp/s.png -t app --color yellow --arrow 0,0,50,50
-screenshot /tmp/s.png -t app --grid 100    # coordinate grid overlay
-```
-
-### mouse (`~/bin/mouse`)
-```bash
-mouse pos                                  # current cursor position
 mouse click 500,300                        # left click (absolute)
 mouse click 50,80 -t notepad              # click relative to window
 mouse rclick 500,300                       # right click
 mouse dclick 200,100                       # double click
 mouse drag 100,200 500,300                 # drag from → to
 mouse scroll down 5                        # scroll down 5 notches
-mouse scroll up -t chrome                  # scroll up in Chrome
 ```
 
-### sendkeys (`~/bin/sendkeys`)
+### sendkeys
 ```bash
 sendkeys -t notepad "Hello World"          # type text (clipboard paste)
 sendkeys -t chrome --key ctrl+l            # hotkey
 sendkeys --key enter                       # single key
 sendkeys --keys "tab,tab,enter"            # key sequence
 sendkeys -r 5 --key tab                    # repeat key N times
-sendkeys -r 3 -p 500 --key down           # repeat with pause between
 ```
 
-### winctl (`~/bin/winctl`)
+### winctl
 ```bash
 winctl list                                # list all visible windows
 winctl list chrome                         # filter by title/process
 winctl focus notepad                       # bring to foreground
-winctl minimize chrome                     # minimize
-winctl maximize chrome                     # maximize
 winctl close "Untitled"                    # close window
 ```
 
-### detect (`~/bin/detect`) — YOLO object detection
+### detect — YOLO object detection
 ```bash
-detect -t chrome                           # detect COCO objects (80 classes, ~15ms)
 detect -t chrome "chair,car,person"        # open-vocabulary (YOLO-World)
-detect --file image.png "chair" -c 0.3     # detect in file, custom confidence
-detect --coco -t chrome                    # force COCO model
-detect --list                              # list 80 COCO class names
-detect -t chrome --vis                     # save annotated image to /tmp/detect_vis.png
+detect -t chrome --coco                    # 80 COCO classes (~15ms)
 detect --start / --stop                    # manage YOLO server
 ```
-
-### imgcrop (`~/bin/imgcrop`) — crop images by coords, grid, or detection
-```bash
-imgcrop image.png 370,540,460,480          # crop by X,Y,W,H
-imgcrop image.png --grid 3x3              # print grid cell info
-imgcrop image.png --grid 3x3 --cell 1,2   # extract single cell [row,col]
-imgcrop image.png --grid 3x3 --all        # save all cells as separate files
-imgcrop image.png --detect "chair"         # crop to first YOLO chair detection
-imgcrop image.png --detect --coco --all    # crop all COCO detections
-imgcrop image.png --ocr "Submit"           # crop to OCR text match
-imgcrop image.png --pad 10 ...            # add padding around any crop
-```
-
-**When to use what:**
-- **OCR** (`click_text`/`find_text`): clicking buttons, reading text — anything with text labels
-- **YOLO** (`detect`): finding real-world objects in images (~15ms) — chairs, cars, people, etc.
 
 ## Key patterns
 
 ### Targeting windows
 All tools support `--title`/`-t` for window targeting (case-insensitive substring match):
-- `screenshot -t chrome` — captures even if behind other windows
-- `mouse click 100,200 -t chrome` — coordinates relative to Chrome's top-left
-- `click_text "Search" -t chrome` — OCR + click, window-relative
-- `sendkeys -t notepad "text"` — focuses window then types
+```bash
+click_text "Search" -t chrome              # OCR + click, window-relative
+mouse click 100,200 -t chrome             # coordinates relative to window
+som mark -t chrome                        # detect elements in specific window
+sendkeys -t notepad "text"                # focuses window then types
+```
 
 **Always prefer `--title` over alt-tab.** It's reliable and doesn't depend on focus.
 
 ### Browser automation
 ```bash
-# Navigate
 sendkeys -t chrome --key ctrl+l && sendkeys -t chrome "https://example.com" && sendkeys -t chrome --key enter
-wait_for "expected text" -t chrome                     # wait for page load
-
-# Interact
-click_text "Sign In" -t chrome                         # click a button/link
-mouse click X,Y -t chrome                              # click by coordinates
-sendkeys -t chrome "form value"                        # type into focused field
-
-# Read
-read_screen -t chrome --text-only                      # read page text
-find_text "Status:" -t chrome                          # find specific text
+wait_for "expected text" -t chrome
+click_text "Sign In" -t chrome
+read_screen -t chrome --text-only
 ```
 
-### Form filling pattern
+### Form filling
 ```bash
-click_text "Username" -t chrome --offset 200,0         # click input field right of label
+click_text "Username" -t chrome --offset 200,0
 sendkeys -t chrome "myuser"
-sendkeys -t chrome --key tab                           # next field
+sendkeys -t chrome --key tab
 sendkeys -t chrome "mypassword"
 click_text "Submit" -t chrome
 ```
 
-### Wait for async operations
+### Typical interaction flow
 ```bash
-click_text "Save" -t app
-wait_for "Saved successfully" -t app --timeout 10
-# or
-wait_for "Saving..." -t app --gone --timeout 10
+# Step 1: ALWAYS start with som to understand the UI
+som mark -t app
+# Read /tmp/som/screen_marked.png — see all numbered elements
+# Read /tmp/som/screen_clean.png — clean view for context
+som click 23 -t app                        # click by number
+
+# Step 2: if som doesn't detect the target, use gridzoom
+gridzoom capture -t app
+gridzoom zoom D4                           # zoom to area of interest
+# Read the clean image to see what's there
+gridzoom click B5 -t app                   # click by grid cell
+
+# Step 3: if grid cell center misses, refine with SAM
+gridzoom refine B5 -t app                  # SAM finds exact object centroid
 ```
 
 ## Interpreting the user's request
 
 When the user says `/ui`, parse their intent:
 
-- **"click on X"** → `click_text "X" -t <app>`
-- **"read/what's on screen"** → `read_screen -t <app>` or `screenshot`
-- **"type X into Y"** → `click_text "Y" -t <app>` then `sendkeys -t <app> "X"`
+- **"click on X"** → `som mark -t <app>` to find it, then `som click N` (or `click_text "X"` if you're sure of the label)
+- **"read/what's on screen"** → `read_screen -t <app>`
+- **"type X into Y"** → `som mark -t <app>` to find the field, `som click N`, then `sendkeys -t <app> "X"`
+- **"interact with this app"** → `som mark -t <app>` first — always start by seeing what's there
 - **"wait for X"** → `wait_for "X" -t <app>`
 - **"scroll down"** → `mouse scroll down -t <app>`
 - **"list windows"** → `winctl list`
-- **Complex multi-step** → chain tools, verify with `read_screen`/`wait_for` after each action
-
-## Workflow examples
-
-### Web search
-```bash
-click_text "Ask Google" -t chrome                          # click search box
-sendkeys -t chrome "weather tomorrow" && sendkeys -t chrome --key enter
-wait_for "Results for" -t chrome --timeout 5               # wait for results
-read_screen -t chrome --text-only                          # read the answer
-```
-
-### Navigate and fill a web form
-```bash
-sendkeys -t chrome --key ctrl+l                            # focus address bar
-sendkeys -t chrome "https://example.com/login" && sendkeys -t chrome --key enter
-wait_for "Sign in" -t chrome --timeout 10                  # wait for page load
-click_text "Email" -t chrome --offset 200,0                # click input next to label
-sendkeys -t chrome "user@example.com"
-sendkeys -t chrome --key tab                               # move to next field
-sendkeys -t chrome "password123"
-click_text "Sign in" -t chrome                             # submit
-wait_for "Welcome" -t chrome --timeout 10                  # confirm success
-```
-
-### Explore an unfamiliar desktop app
-```bash
-winctl list                                                # find the app
-read_screen -t myapp --text-only                           # read all UI text
-click_text "File" -t myapp                                 # open menu
-read_screen -t myapp --text-only                           # read menu items
-click_text "Settings" -t myapp                             # navigate
-read_screen -t myapp --text-only                           # read settings panel
-```
-
-### Multi-step with verification
-```bash
-click_text "Save" -t app
-wait_for "Saved" -t app --timeout 10                       # wait for confirmation
-# or if no confirmation text:
-read_screen -t app --text-only                             # check state changed
-```
-
-### When you must use coordinates (no text, no detectable object)
-```bash
-# Use find_text as an anchor, then offset
-find_text "Color picker" -t app                            # get anchor coordinates
-mouse click X,Y -t app --offset 50,30                     # click relative to anchor
-
-# Last resort: crop small area + grid for estimation
-screenshot /tmp/crop.png -t app --crop X,Y,W,H --grid 50  # small crop with grid
-# Estimate from grid lines (expect ~15-20px error)
-```
+- **"find the button/icon"** → `som mark -t <app>` → if not found → `gridzoom capture -t <app>`
 
 $ARGUMENTS

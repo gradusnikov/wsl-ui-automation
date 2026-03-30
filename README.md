@@ -73,9 +73,23 @@ gridzoom refine B5 -t chrome               # SAM segment → exact centroid → 
 
 1. **One capture** — take a single hi-res screenshot of the window
 2. **Zoom via image manipulation** — all subsequent "zooms" are crops of the original image (no re-grab)
-3. **Chess-style grid** — each image gets an NxN grid with labels (A1, B5, etc.)
+3. **Depth-aware grid labels** — labels encode zoom depth (`A1` at d=0, `A11` at d=1, `A21` at d=2) so you always know which level you're on
 4. **Affine transforms** — the tool tracks scale + offset at each level, maps grid cells back to screen pixels
 5. **SAM refinement** — when grid cell centers don't align with element centers, SAM finds the actual object
+
+### Depth-Aware Labels
+
+Cell labels follow the format `{column}{depth}{row}`, where the depth digit is omitted at depth 0. Each depth level has a distinct color:
+
+| Depth | Labels | Grid Color | Example |
+|-------|--------|------------|---------|
+| 0 | `A1..E5` | Yellow | `gridzoom zoom C3` |
+| 1 | `A11..E15` | Cyan | `gridzoom zoom [C12,D12]` |
+| 2 | `A21..E25` | Magenta | `gridzoom zoom A23` |
+| 3 | `A31..E35` | Green | `gridzoom click B32 -t chrome` |
+| 4+ | `A41..E45` | Orange | continues for deeper levels |
+
+This eliminates confusion when navigating multiple zoom levels — seeing `B23` immediately tells you "depth 2, column B, row 3".
 
 ### Coordinate Transform
 
@@ -86,8 +100,9 @@ Each zoom level computes its transform **directly to the original** image — no
 ### Commands
 
 ```bash
-gridzoom capture [-t TITLE]       # capture window, overlay 10x10 grid
-gridzoom zoom [ID] CELL[+N]      # zoom: CELL+1 = 3x3, CELL+2 = 5x5, CELL+0 = single cell
+gridzoom capture [-t TITLE]       # capture window, overlay grid
+gridzoom zoom [ID] CELL           # zoom to single cell
+gridzoom zoom [ID] [C1,C2]        # zoom to rectangular region
 gridzoom resolve [ID] CELL        # print screen coordinates for cell center
 gridzoom click [ID] CELL [-t T]   # resolve + mouse click
 gridzoom refine [ID] CELL [-t T]  # SAM segment → centroid → click
@@ -97,18 +112,10 @@ gridzoom clean                    # remove session files
 ### Output
 
 Every command produces:
-- **Grid image** — with labeled circular markers for cell reference
+- **Grid image** — with depth-colored labeled markers for cell reference
 - **Clean image** — without overlay, for visual inspection
 - **Coordinate map** — text table of all cell centers in window coordinates
-- **JSON metadata** — affine transform, grid params, parent linkage
-
-### Zoom Padding
-
-`+N` controls how much context around the target cell:
-- `D4+0` — just the single cell (1/100 of image) — pinpoint
-- `D4` or `D4+1` — 3x3 window (9/100) — **default, recommended**
-- `D4+2` — 5x5 window (25/100) — wide context
-- `D4+3` — 7x7 window (49/100) — very wide
+- **JSON metadata** — affine transform, grid params, depth, parent linkage
 
 ## Setup
 

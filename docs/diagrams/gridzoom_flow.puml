@@ -20,37 +20,45 @@ participant "SAM Server\n:18202" as sam
 participant "mouse" as m
 database "Session\n/tmp/gridzoom/" as db
 
-== Capture (once per session) ==
+== Capture (depth 0 — yellow labels A1..E5) ==
 LLM -> gz: capture -t chrome
 gz -> ss: screenshot clean.png -t chrome
 ss --> gz: hi-res image (1294x1399)
-gz -> gz: resize to 1024px display\ndraw 10x10 chess grid\ncompute affine transform T
+gz -> gz: resize to 1024px display\ndraw grid with depth-0 yellow labels (A1..E5)\ncompute affine transform T
 gz -> db: save clean + grid + metadata.json
 gz --> LLM: image ID, grid file, cell coordinate map
 
-== Zoom (crop from original, no re-grab) ==
-LLM -> gz: zoom D4
-note right: default +1 padding\n→ 3x3 region C3..E5
+== Zoom (depth 1 — cyan labels A11..E15) ==
+LLM -> gz: zoom [B2,C3]
+note right: depth 1 labels encode\nzoom level in cell name
 gz -> db: load root clean image
-gz -> gz: crop region in original coords\nrescale to display size\nnew grid overlay\nnew transform T'
+gz -> gz: crop region in original coords\nrescale to display size\nnew grid with depth-1 cyan labels\nnew transform T'
 gz -> db: save child clean + grid + metadata
-gz --> LLM: child ID, both images, coordinate map
+gz --> LLM: child ID, both images, coordinate map (A11..E15)
 
-== Resolve (pure math) ==
-LLM -> gz: resolve B5
+== Zoom again (depth 2 — magenta labels A21..E25) ==
+LLM -> gz: zoom [C12,D12]
+note right: cell refs use depth-1\nformat from parent
+gz -> db: load depth-1 image
+gz -> gz: crop + rescale + depth-2 magenta grid\nnew transform T''
+gz --> LLM: coordinate map (A21..E25)
+
+== Click (uses depth-aware cell ref) ==
+LLM -> gz: click C22 -t chrome
 gz -> db: load image metadata
-gz -> gz: cell B5 center → display coords\napply T' → original coords\n+ screen offset → screen coords
-gz --> LLM: "394,468"
+gz -> gz: cell C22 center → display coords\napply T'' → original coords\n+ screen offset → screen coords
+gz -> m: mouse click 516,490 -t chrome
+gz --> LLM: "clicked C22 → 516,490 (window: chrome)"
 
 == Refine (SAM segmentation) ==
-LLM -> gz: refine B5 -t chrome
+LLM -> gz: refine B23 -t chrome
 gz -> db: load clean image for this level
-gz -> gz: compute B5 center in display pixels
+gz -> gz: compute B23 center in display pixels
 gz -> sam: POST /segment_point?x=385&y=466\n(image bytes)
 sam --> gz: smallest segment at point\ncentroid=(404,456) bbox area=1800px
-gz -> gz: map centroid through T' → window coords
+gz -> gz: map centroid through T'' → window coords
 gz -> m: mouse click 404,456 -t chrome
 m --> gz: done
-gz --> LLM: "clicked B5 → 404,456 (window: chrome)"
+gz --> LLM: "clicked B23 → 404,456 (window: chrome)"
 
 @enduml
