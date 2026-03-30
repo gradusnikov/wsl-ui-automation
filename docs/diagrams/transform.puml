@@ -1,0 +1,47 @@
+@startuml transform
+!theme plain
+skinparam backgroundColor #1a1a2e
+skinparam defaultFontColor #e0e0e0
+skinparam objectBackgroundColor #16213e
+skinparam objectBorderColor #0f3460
+skinparam arrowColor #e94560
+skinparam titleFontColor #e94560
+skinparam noteBackgroundColor #16213e
+skinparam noteBorderColor #533483
+
+title Affine Transform Chain — Grid Cell to Screen Coordinates
+
+object "Display Image" as disp {
+  size = 1024 x 1107
+  grid = 10 x 10
+  cell B5 center = (150, 468) px
+}
+
+object "Original Screenshot" as orig {
+  size = 1294 x 1399
+  window-relative coords
+}
+
+object "Screen" as screen {
+  window offset = (1273, 0)
+  absolute screen coords
+}
+
+disp --> orig : T = [sx  0  tx]\n    [0  sy ty]\n    [0  0   1]\n\norig_x = sx * disp_x + tx\norig_y = sy * disp_y + ty
+orig --> screen : screen_x = orig_x + offset_x\nscreen_y = orig_y + offset_y
+
+note bottom of disp
+  Each zoom level computes T
+  **directly to original** —
+  no matrix chain composition,
+  no floating-point drift.
+end note
+
+note bottom of orig
+  For -t (window-relative) clicks:
+  use orig coords directly.
+  For absolute clicks:
+  add screen offset.
+end note
+
+@enduml

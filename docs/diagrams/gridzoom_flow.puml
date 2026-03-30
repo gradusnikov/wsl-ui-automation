@@ -1,0 +1,56 @@
+@startuml gridzoom_flow
+!theme plain
+skinparam backgroundColor #1a1a2e
+skinparam defaultFontColor #e0e0e0
+skinparam sequenceParticipantBackgroundColor #16213e
+skinparam sequenceParticipantBorderColor #0f3460
+skinparam sequenceArrowColor #e94560
+skinparam sequenceLifeLineBorderColor #533483
+skinparam sequenceGroupBackgroundColor #0f3460
+skinparam noteBackgroundColor #16213e
+skinparam noteBorderColor #533483
+skinparam titleFontColor #e94560
+
+title gridzoom — Hierarchical Visual Navigation Flow
+
+actor LLM
+participant "gridzoom" as gz
+participant "screenshot" as ss
+participant "SAM Server\n:18202" as sam
+participant "mouse" as m
+database "Session\n/tmp/gridzoom/" as db
+
+== Capture (once per session) ==
+LLM -> gz: capture -t chrome
+gz -> ss: screenshot clean.png -t chrome
+ss --> gz: hi-res image (1294x1399)
+gz -> gz: resize to 1024px display\ndraw 10x10 chess grid\ncompute affine transform T
+gz -> db: save clean + grid + metadata.json
+gz --> LLM: image ID, grid file, cell coordinate map
+
+== Zoom (crop from original, no re-grab) ==
+LLM -> gz: zoom D4
+note right: default +1 padding\n→ 3x3 region C3..E5
+gz -> db: load root clean image
+gz -> gz: crop region in original coords\nrescale to display size\nnew grid overlay\nnew transform T'
+gz -> db: save child clean + grid + metadata
+gz --> LLM: child ID, both images, coordinate map
+
+== Resolve (pure math) ==
+LLM -> gz: resolve B5
+gz -> db: load image metadata
+gz -> gz: cell B5 center → display coords\napply T' → original coords\n+ screen offset → screen coords
+gz --> LLM: "394,468"
+
+== Refine (SAM segmentation) ==
+LLM -> gz: refine B5 -t chrome
+gz -> db: load clean image for this level
+gz -> gz: compute B5 center in display pixels
+gz -> sam: POST /segment_point?x=385&y=466\n(image bytes)
+sam --> gz: smallest segment at point\ncentroid=(404,456) bbox area=1800px
+gz -> gz: map centroid through T' → window coords
+gz -> m: mouse click 404,456 -t chrome
+m --> gz: done
+gz --> LLM: "clicked B5 → 404,456 (window: chrome)"
+
+@enduml

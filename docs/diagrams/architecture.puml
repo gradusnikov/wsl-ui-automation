@@ -1,0 +1,70 @@
+@startuml architecture
+!theme plain
+skinparam backgroundColor #1a1a2e
+skinparam defaultFontColor #e0e0e0
+skinparam componentBackgroundColor #16213e
+skinparam componentBorderColor #0f3460
+skinparam packageBackgroundColor #1a1a2e
+skinparam packageBorderColor #0f3460
+skinparam arrowColor #e94560
+skinparam noteBorderColor #533483
+skinparam noteBackgroundColor #1a1a2e
+skinparam titleFontColor #e94560
+
+title WSL UI Automation Toolkit — Architecture
+
+package "Precision Targeting Layer" as precision #1a1a2e {
+  [gridzoom] as gz
+  [som] as som
+  note right of gz
+    Grid-based navigation
+    Hierarchical zoom
+    Affine transforms
+    SAM refinement
+  end note
+  note right of som
+    Set-of-Marks
+    Element numbering
+    Click by ID
+  end note
+}
+
+package "AI Vision Layer" as vision #1a1a2e {
+  [click_text] as ct
+  [find_text] as ft
+  [read_screen] as rs
+  [wait_for] as wf
+  [detect] as det
+}
+
+package "GPU Servers" as servers #0f3460 {
+  [OCR Server\n:18200\nEasyOCR] as ocr
+  [YOLO Server\n:18201\nYOLO-World + COCO] as yolo
+  [SAM Server\n:18202\nMobileSAM] as sam
+}
+
+package "Windows API Layer" as winapi #1a1a2e {
+  [screenshot] as ss
+  [mouse] as m
+  [sendkeys] as sk
+  [winctl] as wc
+}
+
+cloud "Windows Desktop" as desktop {
+}
+
+ct --> ocr
+ft --> ocr
+rs --> ocr
+wf --> ocr
+som --> ocr
+det --> yolo
+gz --> sam
+gz --> ss
+
+ss --> desktop : PrintWindow API
+m --> desktop : SendInput API
+sk --> desktop : SendKeys / Clipboard
+wc --> desktop : EnumWindows API
+
+@enduml

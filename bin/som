@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Set-of-Marks: detect UI elements, number them, click by number.
+
+Usage:
+  som mark [-t TITLE] [-w] [--conf 0.3]      Detect elements, annotate, print marker list
+  som click N [-t TITLE]                      Click marker N
+  som clean                                   Remove session files
+
+Examples:
+  som mark -t chrome                  # detect all text elements in Chrome
+  som click 5                         # click marker #5 (screen coords)
+  som click 5 -t chrome               # click marker #5 (window-relative)
+"""
+
+import sys
+import os
+import json
+import argparse
+import subprocess
+import urllib.request
+from pathlib import Path
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.exit("Error: Pillow required")
+
+BASE_DIR = Path("/tmp/som")
+SCREENSHOT_BIN = os.path.expanduser("~/bin/screenshot")
+MOUSE_BIN = os.path.expanduser("~/bin/mouse")
+OCR_URL = "http://127.0.0.1:18200"
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+
+
+def ocr_detect(image_path):
+    """Send image to OCR server, return list of detections."""
+    with open(image_path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        f"{OCR_URL}/ocr",
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    return json.loads(resp.read())
+
+
+def draw_markers(img, elements):
+    """Draw numbered markers on image. Returns annotated copy."""
+    img = img.copy().convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    try:
+        font = ImageFont.truetype(FONT_PATH, 13)
+        font_sm = ImageFont.truetype(FONT_PATH, 10)
+    except OSError:
+        font = ImageFont.load_default()
+        font_sm = font
+
+    for i, el in enumerate(elements):
+        cx, cy = el["center"]
+        bx, by, bw, bh = el["bbox"]
+
+        # Draw bbox highlight
+        draw.rectangle(
+            [bx, by, bx + bw, by + bh],
+            outline=(0, 255, 0, 180),
+            width=2,
+        )
+
+        # Draw marker badge (numbered circle)
+        label = str(i)
+        tb = font.getbbox(label)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        badge_w = max(tw + 8, th + 8)
+        badge_x = bx - 2
+        badge_y = by - badge_w - 2
+
+        # Keep badge on screen
+        if badge_y < 0:
+            badge_y = by + bh + 2
+        if badge_x + badge_w > img.width:
+            badge_x = img.width - badge_w - 2
+
+        draw.ellipse(
+            [badge_x, badge_y, badge_x + badge_w, badge_y + badge_w],
+            fill=(255, 0, 0, 220),
+        )
+        draw.text(
+            (badge_x + (badge_w - tw) / 2, badge_y + (badge_w - th) / 2),
+            label,
+            fill=(255, 255, 255, 255),
+            font=font,
+        )
+
+    return Image.alpha_composite(img, overlay).convert("RGB")
+
+
+def cmd_mark(args):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    clean_path = BASE_DIR / "screen_clean.png"
+    marked_path = BASE_DIR / "screen_marked.png"
+    meta_path = BASE_DIR / "markers.json"
+
+    # Capture
+    cmd = [SCREENSHOT_BIN, str(clean_path)]
+    title = getattr(args, "title", None)
+    if title:
+        cmd += ["-t", title]
+    elif getattr(args, "window", False):
+        cmd.append("-w")
+
+    subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if not clean_path.exists():
+        sys.exit("Error: screenshot failed")
+
+    # OCR detect
+    results = ocr_detect(str(clean_path))
+
+    # Filter by confidence
+    min_conf = args.conf if args.conf else 0.3
+    elements = [r for r in results if r.get("confidence", 0) >= min_conf]
+
+    # Sort: top-to-bottom, left-to-right (for stable numbering)
+    elements.sort(key=lambda e: (e["center"][1] // 20, e["center"][0]))
+
+    # Draw markers
+    img = Image.open(clean_path)
+    marked = draw_markers(img, elements)
+    marked.save(marked_path)
+
+    # Save metadata
+    meta = {
+        "title": title,
+        "image_size": list(img.size),
+        "marker_count": len(elements),
+        "markers": [
+            {
+                "id": i,
+                "text": el["text"],
+                "center": el["center"],
+                "bbox": el["bbox"],
+                "confidence": el.get("confidence", 0),
+            }
+            for i, el in enumerate(elements)
+        ],
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # Output
+    print(f"marked: {marked_path}")
+    print(f"clean: {clean_path}")
+    print(f"found: {len(elements)} elements")
+    print()
+    for i, el in enumerate(elements):
+        cx, cy = el["center"]
+        print(f"  {i:3d}  {el['text']:<30s}  ({cx},{cy})")
+
+
+def cmd_click(args):
+    meta_path = BASE_DIR / "markers.json"
+    if not meta_path.exists():
+        sys.exit("Error: no markers. Run 'som mark' first.")
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    marker_id = args.marker_id
+    markers = meta["markers"]
+    if marker_id < 0 or marker_id >= len(markers):
+        sys.exit(f"Error: marker {marker_id} not found (0..{len(markers)-1})")
+
+    m = markers[marker_id]
+    cx, cy = m["center"]
+
+    title = getattr(args, "title", None)
+    if title:
+        cmd = [MOUSE_BIN, "click", f"{cx},{cy}", "-t", title]
+    else:
+        cmd = [MOUSE_BIN, "click", f"{cx},{cy}"]
+
+    subprocess.run(cmd, timeout=10)
+    print(f"clicked #{marker_id} \"{m['text']}\" → {cx},{cy}" +
+          (f" (window: {title})" if title else ""))
+
+
+def cmd_clean(args):
+    import shutil
+    if BASE_DIR.exists():
+        shutil.rmtree(BASE_DIR)
+        print("Cleaned.")
+    else:
+        print("Nothing to clean.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Set-of-Marks: detect, number, click UI elements",
+        usage="som <command> [args]",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_mark = sub.add_parser("mark", help="Detect elements and annotate")
+    p_mark.add_argument("-t", "--title", help="Window title/process to capture")
+    p_mark.add_argument("-w", "--window", action="store_true", help="Active window")
+    p_mark.add_argument("--conf", type=float, default=0.3, help="Min OCR confidence")
+
+    p_click = sub.add_parser("click", help="Click a marker by number")
+    p_click.add_argument("marker_id", type=int, help="Marker number")
+    p_click.add_argument("-t", "--title", help="Window-relative click")
+
+    sub.add_parser("clean", help="Remove session files")
+    sub.add_parser("help", help="Show help")
+
+    if len(sys.argv) < 2:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+
+    if args.command == "mark":
+        cmd_mark(args)
+    elif args.command == "click":
+        cmd_click(args)
+    elif args.command == "clean":
+        cmd_clean(args)
+    elif args.command == "help":
+        print(__doc__)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

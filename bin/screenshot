@@ -15,6 +15,7 @@ TITLE=""
 CROP=""
 ANNOTATIONS=()
 GRID=0
+CHESS=""
 
 # Parse arguments — first positional arg (not starting with -) is the filename
 while [[ $# -gt 0 ]]; do
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --grid)
       GRID="${2:-100}"
+      shift 2
+      ;;
+    --chess)
+      CHESS="${2:-8}"
       shift 2
       ;;
     --hide|-h)
@@ -129,6 +134,7 @@ Annotations (can be repeated, drawn in order):
   --label X,Y "text"         Text label at (X,Y)
   --color NAME               Set color for subsequent annotations (red,green,blue,yellow,cyan,white)
   --grid [N]                 Draw coordinate grid with N pixel spacing (default 100)
+  --chess [N]                Chess-coordinate grid with NxN cells (default 8). Prints cell centers.
 HELP
       exit 0
       ;;
@@ -424,9 +430,50 @@ for (\$gy = \$startY; \$gy -lt \$b.Height; \$gy += \$spacing) {
 \$gpen.Dispose(); \$gfont.Dispose(); \$gbg.Dispose(); \$gfg.Dispose(); \$gg.Dispose();"
 fi
 
+# Chess grid overlay
+if [ -n "$CHESS" ] && [ "$CHESS" -gt 0 ] 2>/dev/null; then
+  COLS=$CHESS
+  ROWS=$CHESS
+  PS_CMD+="
+\$cg = [System.Drawing.Graphics]::FromImage(\$b);
+\$cg.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias;
+\$cg.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias;
+\$cpen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(140, 255, 255, 0), 2);
+\$cfont = New-Object System.Drawing.Font('Consolas', 12, [System.Drawing.FontStyle]::Bold);
+\$cbg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(180, 0, 0, 0));
+\$cfg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(240, 255, 255, 0));
+\$cols = ${COLS}; \$rows = ${ROWS};
+\$cw = [math]::Floor(\$b.Width / \$cols);
+\$ch = [math]::Floor(\$b.Height / \$rows);
+\$letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+for (\$cx = 1; \$cx -lt \$cols; \$cx++) { \$cg.DrawLine(\$cpen, \$cx * \$cw, 0, \$cx * \$cw, \$b.Height); }
+for (\$cy = 1; \$cy -lt \$rows; \$cy++) { \$cg.DrawLine(\$cpen, 0, \$cy * \$ch, \$b.Width, \$cy * \$ch); }
+for (\$cy = 0; \$cy -lt \$rows; \$cy++) {
+  for (\$cx = 0; \$cx -lt \$cols; \$cx++) {
+    \$lbl = \$letters[\$cx].ToString() + (\$cy + 1).ToString();
+    \$sz = \$cg.MeasureString(\$lbl, \$cfont);
+    \$lx = \$cx * \$cw + (\$cw - \$sz.Width) / 2;
+    \$ly = \$cy * \$ch + (\$ch - \$sz.Height) / 2;
+    \$cg.FillRectangle(\$cbg, [int]\$lx - 2, [int]\$ly - 1, [int]\$sz.Width + 4, [int]\$sz.Height + 2);
+    \$cg.DrawString(\$lbl, \$cfont, \$cfg, [float]\$lx, [float]\$ly);
+  }
+}
+\$cpen.Dispose(); \$cfont.Dispose(); \$cbg.Dispose(); \$cfg.Dispose(); \$cg.Dispose();"
+
+  # Print cell center coordinates to stderr (so they appear even when piped)
+  echo "Chess grid: ${COLS}x${ROWS}" >&2
+  # We need image dimensions - compute after PS runs, so build a bash lookup table
+  CHESS_PRINT=true
+fi
+
 # Save
 PS_CMD+="
 \$b.Save('${WIN_PATH}');"
+
+if [ "${CHESS_PRINT:-false}" = true ]; then
+  PS_CMD+="
+Write-Output \"IMGSIZE:\$(\$b.Width),\$(\$b.Height)\";"
+fi
 
 # Restore terminal
 if [ "$HIDE_WINDOW" = true ]; then
@@ -435,9 +482,32 @@ if [ "$HIDE_WINDOW" = true ]; then
 fi
 
 # Execute
-powershell.exe -Command "$PS_CMD"
+if [ "${CHESS_PRINT:-false}" = true ]; then
+  PS_OUT=$(powershell.exe -Command "$PS_CMD" 2>&1)
+  IMG_DIMS=$(echo "$PS_OUT" | grep '^IMGSIZE:' | tr -d '\r')
+else
+  powershell.exe -Command "$PS_CMD"
+fi
 
 echo "Saved: $FILENAME"
+
+# Print chess grid coordinate table
+if [ "${CHESS_PRINT:-false}" = true ] && [ -n "$IMG_DIMS" ]; then
+  IFS=',' read -r IMG_W IMG_H <<< "${IMG_DIMS#IMGSIZE:}"
+  LETTERS="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  CW=$((IMG_W / COLS))
+  CH=$((IMG_H / ROWS))
+  for ((row=0; row<ROWS; row++)); do
+    for ((col=0; col<COLS; col++)); do
+      L=${LETTERS:$col:1}
+      R=$((row + 1))
+      CX=$((col * CW + CW / 2))
+      CY=$((row * CH + CH / 2))
+      printf "%s%d=%d,%d  " "$L" "$R" "$CX" "$CY"
+    done
+    echo
+  done
+fi
 
 # Open after saving
 if [ "$OPEN_AFTER" = true ]; then

@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""Hierarchical grid-based visual navigator for GUI automation.
+
+Usage:
+  gridzoom capture [-t TITLE] [-w] [--grid 10x10] [--size 1024]
+  gridzoom zoom [ID] CELL[+N] [--grid COLSxROWS]
+  gridzoom click [ID] CELL [-t TITLE]
+  gridzoom resolve [ID] CELL
+  gridzoom refine [ID] CELL [-t TITLE]
+  gridzoom clean [SESSION]
+
+Examples:
+  gridzoom capture -t chrome                # capture chrome, overlay 10x10 grid
+  gridzoom zoom C3                          # zoom 3x3 around C3 (default +1 padding)
+  gridzoom zoom C3+2                        # zoom 5x5 around C3
+  gridzoom zoom C3+0                        # zoom to just cell C3
+  gridzoom refine E5                        # SAM segment at E5 → exact centroid coords
+  gridzoom refine E5 -t chrome              # same, window-relative click
+  gridzoom click B4                         # resolve B4 → mouse click at screen coords
+  gridzoom resolve B4                       # just print screen coords
+  gridzoom zoom C3 --grid 12x8              # zoom with custom grid
+  gridzoom click 0001 B4                    # click B4 of specific image
+  gridzoom clean                            # remove all sessions
+"""
+
+import sys
+import os
+import json
+import uuid
+import argparse
+import subprocess
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.exit("Error: PIL/Pillow required. Install with: pip install Pillow")
+
+BASE_DIR = Path("/tmp/gridzoom")
+SCREENSHOT_BIN = os.path.expanduser("~/bin/screenshot")
+MOUSE_BIN = os.path.expanduser("~/bin/mouse")
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+DEFAULT_GRID = (10, 10)
+DEFAULT_DISPLAY_WIDTH = 1024
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+SAM_URL = "http://127.0.0.1:18202"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def parse_cell(ref):
+    """Parse 'C3' → (col=2, row=2, padding=None) 0-indexed.
+    Also handles 'C3+2' → (col=2, row=2, padding=2)."""
+    ref = ref.strip().upper()
+    padding = None
+    if "+" in ref:
+        ref, pad_str = ref.split("+", 1)
+        try:
+            padding = int(pad_str)
+        except ValueError:
+            sys.exit(f"Error: invalid padding '+{pad_str}'")
+    if len(ref) < 2:
+        sys.exit(f"Error: invalid cell '{ref}'")
+    letter = ref[0]
+    if letter not in LETTERS:
+        sys.exit(f"Error: invalid column '{letter}'")
+    col = LETTERS.index(letter)
+    try:
+        row = int(ref[1:]) - 1
+    except ValueError:
+        sys.exit(f"Error: invalid row in '{ref}'")
+    return col, row, padding
+
+
+def cell_label(col, row):
+    return f"{LETTERS[col]}{row + 1}"
+
+
+def parse_grid(s):
+    """Parse '10x10' or '12x8' → (cols, rows)."""
+    parts = s.lower().split("x")
+    if len(parts) != 2:
+        sys.exit(f"Error: invalid grid '{s}', expected COLSxROWS (e.g. 10x10)")
+    return int(parts[0]), int(parts[1])
+
+
+def load_meta(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_meta(meta, path):
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def get_session_dir(session_id):
+    return BASE_DIR / session_id
+
+
+def find_latest_session():
+    """Find the most recently modified session directory."""
+    if not BASE_DIR.exists():
+        return None
+    sessions = sorted(BASE_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    for s in sessions:
+        if s.is_dir() and (s / "session.json").exists():
+            return s.name
+    return None
+
+
+def find_latest_image(session_id):
+    """Find the highest-sequence image in a session."""
+    sdir = get_session_dir(session_id)
+    metas = sorted(sdir.glob("*.json"))
+    metas = [m for m in metas if m.name != "session.json"]
+    if not metas:
+        return None
+    return load_meta(metas[-1])
+
+
+def resolve_image(raw_id):
+    """Resolve a raw ID (e.g. '0001', '1', full id, or None for last) to (session_id, meta)."""
+    session_id = find_latest_session()
+    if session_id is None:
+        sys.exit("Error: no active session. Run 'gridzoom capture' first.")
+
+    # No ID given → latest image
+    if raw_id is None:
+        meta = find_latest_image(session_id)
+        if meta is None:
+            sys.exit("Error: no images in session.")
+        return session_id, meta
+
+    # Try as sequence number
+    sdir = get_session_dir(session_id)
+    try:
+        seq = int(raw_id)
+        seq_str = f"{seq:04d}"
+        candidates = list(sdir.glob(f"*-{seq_str}.json"))
+        if candidates:
+            return session_id, load_meta(candidates[0])
+    except ValueError:
+        pass
+
+    # Try as full ID
+    candidate = sdir / f"{raw_id}.json"
+    if candidate.exists():
+        return session_id, load_meta(candidate)
+
+    sys.exit(f"Error: image '{raw_id}' not found in session {session_id}.")
+
+
+def draw_grid(img, cols, rows):
+    """Draw chess-style grid with labels on an image. Returns annotated copy."""
+    img = img.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+    w, h = img.size
+    cell_w = w / cols
+    cell_h = h / rows
+
+    # Adaptive font size
+    cell_min = min(cell_w, cell_h)
+    font_size = max(10, min(28, int(cell_min * 0.32)))
+    try:
+        font = ImageFont.truetype(FONT_PATH, font_size)
+    except OSError:
+        font = ImageFont.load_default()
+
+    line_color = (255, 255, 0, 140)  # yellow, semi-transparent
+    label_bg = (0, 0, 0, 180)
+    label_fg = (255, 255, 0, 240)
+
+    # Grid lines
+    for c in range(1, cols):
+        x = int(c * cell_w)
+        draw.line([(x, 0), (x, h)], fill=line_color, width=2)
+    for r in range(1, rows):
+        y = int(r * cell_h)
+        draw.line([(0, y), (w, y)], fill=line_color, width=2)
+
+    # Labels (circular semi-transparent background)
+    label_bg = (0, 0, 0, 120)
+    for r in range(rows):
+        for c in range(cols):
+            lbl = cell_label(c, r)
+            bb = font.getbbox(lbl)
+            tw, th = bb[2] - bb[0], bb[3] - bb[1]
+            ox, oy = bb[0], bb[1]  # glyph offset from origin
+            cx = c * cell_w + cell_w / 2
+            cy = r * cell_h + cell_h / 2
+            radius = max(tw, th) / 2 + 4
+            draw.ellipse(
+                [cx - radius, cy - radius, cx + radius, cy + radius],
+                fill=label_bg,
+            )
+            draw.text((cx - tw / 2 - ox, cy - th / 2 - oy), lbl, fill=label_fg, font=font)
+
+    return img
+
+
+def print_grid_map(meta):
+    """Print a compact grid map with window-relative coordinates for each cell."""
+    cols, rows = meta["grid"]["cols"], meta["grid"]["rows"]
+    cw, ch = meta["grid"]["cell_width"], meta["grid"]["cell_height"]
+    T = meta["transform_to_original"]
+    lines = []
+    for r in range(rows):
+        parts = []
+        for c in range(cols):
+            dx = c * cw + cw / 2
+            dy = r * ch + ch / 2
+            wx = round(T[0][0] * dx + T[0][2])
+            wy = round(T[1][1] * dy + T[1][2])
+            parts.append(f"{cell_label(c, r)}={wx},{wy}")
+        lines.append("  ".join(parts))
+    print("\n".join(lines))
+
+
+def get_window_offset(title):
+    """Get window top-left in screen coordinates via PowerShell."""
+    ps = f"""Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class WR {{
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT {{ public int L,T,R,B; }}
+}}
+'@
+$pattern = '{title}'.ToLower()
+$procs = Get-Process | Where-Object {{ $_.MainWindowHandle -ne 0 }}
+foreach ($p in $procs) {{
+  $t = ''; try {{ $t = $p.MainWindowTitle.ToLower() }} catch {{ continue }}
+  $n = ''; try {{ $n = $p.ProcessName.ToLower() }} catch {{}}
+  if ($t.Contains($pattern) -or $n.Contains($pattern)) {{
+    $r = New-Object WR+RECT
+    [WR]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+    Write-Output "$($r.L),$($r.T)"
+    exit
+  }}
+}}
+Write-Output '0,0'
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", ps],
+        capture_output=True, text=True, timeout=10,
+    )
+    out = result.stdout.strip().replace("\r", "")
+    if "," in out:
+        parts = out.split("\n")[-1].split(",")
+        return [int(parts[0]), int(parts[1])]
+    return [0, 0]
+
+
+# ── Commands ─────────────────────────────────────────────────────────
+
+def cmd_capture(args):
+    """Take a hi-res screenshot and start a new session."""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    session_short = uuid.uuid4().hex[:8]
+    sdir = get_session_dir(session_short)
+    sdir.mkdir()
+
+    root_id = f"{session_short}-0000"
+    clean_path = sdir / f"{root_id}_clean.png"
+
+    # Build screenshot command
+    cmd = [SCREENSHOT_BIN, str(clean_path)]
+    title = getattr(args, "title", None)
+    if title:
+        cmd += ["-t", title]
+    elif getattr(args, "window", False):
+        cmd.append("-w")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if not clean_path.exists():
+        sys.exit(f"Error: screenshot failed: {result.stderr.strip()}")
+
+    # Get window offset for coordinate mapping
+    screen_offset = [0, 0]
+    if title:
+        screen_offset = get_window_offset(title)
+
+    # Open and compute display dimensions
+    orig = Image.open(clean_path)
+    orig_w, orig_h = orig.size
+    cols, rows = parse_grid(args.grid) if args.grid else DEFAULT_GRID
+    display_w = args.size or DEFAULT_DISPLAY_WIDTH
+    display_h = int(orig_h * display_w / orig_w)
+
+    # Create display image with grid
+    display = orig.resize((display_w, display_h), Image.LANCZOS)
+    grid_img = draw_grid(display, cols, rows)
+    grid_path = sdir / f"{root_id}_grid.png"
+    grid_img.save(grid_path)
+
+    cell_w = display_w / cols
+    cell_h = display_h / rows
+
+    # Transform: display coords → original coords
+    sx = orig_w / display_w
+    sy = orig_h / display_h
+    transform = [[sx, 0, 0], [0, sy, 0], [0, 0, 1]]
+
+    # Save image metadata
+    meta = {
+        "id": root_id,
+        "session_id": session_short,
+        "parent_id": None,
+        "parent_cell": None,
+        "depth": 0,
+        "seq": 0,
+        "original_size": [orig_w, orig_h],
+        "crop_in_original": [0, 0, orig_w, orig_h],
+        "display_size": [display_w, display_h],
+        "grid": {"cols": cols, "rows": rows,
+                 "cell_width": round(cell_w, 2),
+                 "cell_height": round(cell_h, 2)},
+        "transform_to_original": transform,
+        "screen_offset": screen_offset,
+        "files": {"clean": f"{root_id}_clean.png", "grid": f"{root_id}_grid.png"},
+    }
+    save_meta(meta, sdir / f"{root_id}.json")
+
+    # Save session metadata
+    session_meta = {
+        "session_id": session_short,
+        "created": datetime.now().isoformat(),
+        "capture_target": title or ("window" if getattr(args, "window", False) else "screen"),
+        "screen_offset": screen_offset,
+        "original_size": [orig_w, orig_h],
+        "default_grid": [cols, rows],
+        "default_display_width": display_w,
+        "root_id": root_id,
+        "next_seq": 1,
+    }
+    save_meta(session_meta, sdir / "session.json")
+
+    # Output
+    print(f"image: {root_id}")
+    print(f"grid: {grid_path}")
+    print(f"clean: {clean_path}")
+    print(f"layout: {cols}x{rows} ({cell_label(0,0)}..{cell_label(cols-1, rows-1)})")
+    print(f"original: {orig_w}x{orig_h} → display: {display_w}x{display_h}")
+    print_grid_map(meta)
+
+
+def cmd_zoom(args):
+    """Zoom into a cell with padding, producing a child image from the original."""
+    # Figure out if first positional arg is an ID or a cell
+    image_id, cell_ref = _parse_id_and_cell(args.args)
+    session_id, parent = resolve_image(image_id)
+    sdir = get_session_dir(session_id)
+    session = load_meta(sdir / "session.json")
+
+    col, row, padding = parse_cell(cell_ref)
+    if padding is None:
+        padding = 1  # default: 3x3 window around target cell
+    pcols, prows = parent["grid"]["cols"], parent["grid"]["rows"]
+    if col >= pcols or row >= prows:
+        sys.exit(f"Error: {cell_ref} out of range for {pcols}x{prows} grid "
+                 f"({cell_label(0,0)}..{cell_label(pcols-1, prows-1)})")
+
+    # Compute padded region (clamp to grid bounds)
+    c0 = max(0, col - padding)
+    r0 = max(0, row - padding)
+    c1 = min(pcols, col + padding + 1)
+    r1 = min(prows, row + padding + 1)
+    span_cols = c1 - c0
+    span_rows = r1 - r0
+
+    # Compute region bbox in parent display coords
+    pcw, pch = parent["grid"]["cell_width"], parent["grid"]["cell_height"]
+    disp_x = c0 * pcw
+    disp_y = r0 * pch
+    disp_w = span_cols * pcw
+    disp_h = span_rows * pch
+
+    # Map to original coords via parent's transform
+    T = parent["transform_to_original"]
+    orig_x = T[0][0] * disp_x + T[0][2]
+    orig_y = T[1][1] * disp_y + T[1][2]
+    orig_w = T[0][0] * disp_w
+    orig_h = T[1][1] * disp_h
+
+    # Find root clean image
+    root_id = session["root_id"]
+    clean_path = sdir / f"{root_id}_clean.png"
+    orig = Image.open(clean_path)
+
+    # Crop from original (clamp to image bounds)
+    ox, oy = max(0, int(orig_x)), max(0, int(orig_y))
+    ow = min(int(orig_w), orig.width - ox)
+    oh = min(int(orig_h), orig.height - oy)
+    cropped = orig.crop((ox, oy, ox + ow, oy + oh))
+
+    # Scale to display size
+    cols, rows = parse_grid(args.grid) if args.grid else tuple(session["default_grid"])
+    display_w = session["default_display_width"]
+    display_h = int(oh * display_w / ow) if ow > 0 else display_w
+
+    display = cropped.resize((display_w, display_h), Image.LANCZOS)
+    grid_img = draw_grid(display, cols, rows)
+
+    # New image ID
+    seq = session["next_seq"]
+    new_id = f"{session_id}-{seq:04d}"
+    clean_zoom_path = sdir / f"{new_id}_clean.png"
+    grid_path = sdir / f"{new_id}_grid.png"
+    display.save(clean_zoom_path)
+    grid_img.save(grid_path)
+
+    # Compute transform: new display coords → original coords
+    sx = ow / display_w
+    sy = oh / display_h
+    transform = [[sx, 0, ox], [0, sy, oy], [0, 0, 1]]
+
+    cell_w = display_w / cols
+    cell_h = display_h / rows
+
+    meta = {
+        "id": new_id,
+        "session_id": session_id,
+        "parent_id": parent["id"],
+        "parent_cell": cell_ref.upper(),
+        "depth": parent["depth"] + 1,
+        "seq": seq,
+        "original_size": parent["original_size"],
+        "crop_in_original": [ox, oy, ow, oh],
+        "display_size": [display_w, display_h],
+        "grid": {"cols": cols, "rows": rows,
+                 "cell_width": round(cell_w, 2),
+                 "cell_height": round(cell_h, 2)},
+        "transform_to_original": transform,
+        "screen_offset": parent["screen_offset"],
+        "files": {"clean": f"{new_id}_clean.png", "grid": f"{new_id}_grid.png"},
+    }
+    save_meta(meta, sdir / f"{new_id}.json")
+
+    session["next_seq"] = seq + 1
+    save_meta(session, sdir / "session.json")
+
+    region = f"{cell_label(c0,r0)}..{cell_label(c1-1,r1-1)}" if span_cols > 1 or span_rows > 1 else cell_ref.upper()
+    print(f"image: {new_id}")
+    print(f"grid: {grid_path}")
+    print(f"clean: {clean_zoom_path}")
+    print(f"layout: {cols}x{rows} ({cell_label(0,0)}..{cell_label(cols-1, rows-1)})")
+    print(f"parent: {parent['id']} region {region} ({span_cols}x{span_rows} cells, depth {meta['depth']})")
+    print_grid_map(meta)
+
+
+def _resolve_cell_to_screen(session_id, meta, cell_ref):
+    """Given image metadata and a cell reference, return (screen_x, screen_y)."""
+    col, row, _pad = parse_cell(cell_ref)
+    cols, rows = meta["grid"]["cols"], meta["grid"]["rows"]
+    if col >= cols or row >= rows:
+        sys.exit(f"Error: {cell_ref} out of range for {cols}x{rows} grid")
+
+    cw, ch = meta["grid"]["cell_width"], meta["grid"]["cell_height"]
+    disp_x = col * cw + cw / 2
+    disp_y = row * ch + ch / 2
+
+    T = meta["transform_to_original"]
+    orig_x = T[0][0] * disp_x + T[0][2]
+    orig_y = T[1][1] * disp_y + T[1][2]
+
+    off = meta["screen_offset"]
+    screen_x = round(orig_x + off[0])
+    screen_y = round(orig_y + off[1])
+    return screen_x, screen_y
+
+
+def cmd_resolve(args):
+    """Print screen coordinates for a cell center."""
+    image_id, cell_ref = _parse_id_and_cell(args.args)
+    session_id, meta = resolve_image(image_id)
+    sx, sy = _resolve_cell_to_screen(session_id, meta, cell_ref)
+    print(f"{sx},{sy}")
+
+
+def cmd_click(args):
+    """Resolve a cell to screen coordinates and click."""
+    image_id, cell_ref = _parse_id_and_cell(args.args)
+    session_id, meta = resolve_image(image_id)
+    sx, sy = _resolve_cell_to_screen(session_id, meta, cell_ref)
+
+    # Build mouse command
+    cmd = [MOUSE_BIN, "click", f"{sx},{sy}"]
+
+    # If session was captured with --title and user passed -t, use window-relative
+    title = getattr(args, "title", None)
+    if title:
+        # Recalculate without screen offset (mouse -t does its own offset)
+        col, row, _pad = parse_cell(cell_ref)
+        cw, ch = meta["grid"]["cell_width"], meta["grid"]["cell_height"]
+        disp_x = col * cw + cw / 2
+        disp_y = row * ch + ch / 2
+        T = meta["transform_to_original"]
+        orig_x = round(T[0][0] * disp_x + T[0][2])
+        orig_y = round(T[1][1] * disp_y + T[1][2])
+        cmd = [MOUSE_BIN, "click", f"{orig_x},{orig_y}", "-t", title]
+
+    subprocess.run(cmd, timeout=10)
+    if title:
+        print(f"clicked {cell_ref.upper()} → {orig_x},{orig_y} (window: {title})")
+    else:
+        print(f"clicked {cell_ref.upper()} → {sx},{sy}")
+
+
+def cmd_refine(args):
+    """Use SAM to find the exact object centroid at a grid cell."""
+    import urllib.request
+
+    image_id, cell_ref = _parse_id_and_cell(args.args)
+    session_id, meta = resolve_image(image_id)
+    sdir = get_session_dir(session_id)
+
+    # Find the clean image for this zoom level
+    clean_file = meta["files"].get("clean")
+    if not clean_file:
+        # Root image
+        session = load_meta(sdir / "session.json")
+        clean_file = f"{session['root_id']}_clean.png"
+    clean_path = sdir / clean_file
+    if not clean_path.exists():
+        sys.exit(f"Error: clean image not found: {clean_path}")
+
+    # Compute the query point in display image pixel coordinates
+    col, row, _pad = parse_cell(cell_ref)
+    cols, rows = meta["grid"]["cols"], meta["grid"]["rows"]
+    if col >= cols or row >= rows:
+        sys.exit(f"Error: {cell_ref} out of range for {cols}x{rows} grid")
+
+    cw, ch = meta["grid"]["cell_width"], meta["grid"]["cell_height"]
+    disp_x = int(col * cw + cw / 2)
+    disp_y = int(row * ch + ch / 2)
+
+    # Query SAM server
+    with open(clean_path, "rb") as f:
+        img_data = f.read()
+
+    url = f"{SAM_URL}/segment_point?x={disp_x}&y={disp_y}"
+    req = urllib.request.Request(
+        url, data=img_data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+    except Exception as e:
+        sys.exit(f"Error: SAM server not reachable ({e}). Start with: python3 ~/bin/sam_server.py &")
+
+    result = json.loads(resp.read())
+    hit = result.get("hit")
+
+    if not hit:
+        print(f"No segment found at {cell_ref.upper()} ({disp_x},{disp_y} in display)")
+        return
+
+    # Map segment centroid from display coords to original/screen coords
+    scx, scy = hit["centroid"]
+    T = meta["transform_to_original"]
+    orig_x = T[0][0] * scx + T[0][2]
+    orig_y = T[1][1] * scy + T[1][2]
+
+    off = meta["screen_offset"]
+    screen_x = round(orig_x + off[0])
+    screen_y = round(orig_y + off[1])
+    win_x = round(orig_x)
+    win_y = round(orig_y)
+
+    title = getattr(args, "title", None)
+
+    bx, by, bw, bh = hit["bbox"]
+    print(f"cell {cell_ref.upper()} → segment centroid ({scx},{scy}) in display")
+    print(f"  bbox: [{bx},{by},{bw},{bh}]  area: {hit['area']}px")
+    print(f"  window: {win_x},{win_y}")
+    print(f"  screen: {screen_x},{screen_y}")
+
+    if title:
+        cmd = [MOUSE_BIN, "click", f"{win_x},{win_y}", "-t", title]
+        subprocess.run(cmd, timeout=10)
+        print(f"  clicked → {win_x},{win_y} (window: {title})")
+
+
+def cmd_clean(args):
+    """Remove session(s)."""
+    if not BASE_DIR.exists():
+        print("Nothing to clean.")
+        return
+    target = args.args[0] if args.args else None
+    if target:
+        sdir = get_session_dir(target)
+        if sdir.exists():
+            shutil.rmtree(sdir)
+            print(f"Removed session {target}")
+        else:
+            print(f"Session {target} not found.")
+    else:
+        shutil.rmtree(BASE_DIR)
+        print("All sessions removed.")
+
+
+def _parse_id_and_cell(positional_args):
+    """Parse [ID] CELL from positional args.
+    If 1 arg: treat as CELL (use last image).
+    If 2 args: first is ID, second is CELL.
+    """
+    if not positional_args:
+        sys.exit("Error: cell reference required (e.g. C3)")
+    if len(positional_args) == 1:
+        return None, positional_args[0]
+    return positional_args[0], positional_args[1]
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Hierarchical grid navigator for GUI automation",
+        usage="gridzoom <command> [args]",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # capture
+    p_cap = sub.add_parser("capture", help="Take hi-res screenshot, overlay grid")
+    p_cap.add_argument("-t", "--title", help="Window title/process to capture")
+    p_cap.add_argument("-w", "--window", action="store_true", help="Capture active window")
+    p_cap.add_argument("--grid", help="Grid dimensions (e.g. 10x10, 12x8)")
+    p_cap.add_argument("--size", type=int, help=f"Display image width (default {DEFAULT_DISPLAY_WIDTH})")
+
+    # zoom
+    p_zoom = sub.add_parser("zoom", help="Zoom into a cell")
+    p_zoom.add_argument("args", nargs="+", help="[IMAGE_ID] CELL")
+    p_zoom.add_argument("--grid", help="Override grid dimensions")
+
+    # resolve
+    p_res = sub.add_parser("resolve", help="Get screen coordinates for a cell")
+    p_res.add_argument("args", nargs="+", help="[IMAGE_ID] CELL")
+
+    # click
+    p_click = sub.add_parser("click", help="Resolve cell → mouse click")
+    p_click.add_argument("args", nargs="+", help="[IMAGE_ID] CELL")
+    p_click.add_argument("-t", "--title", help="Pass --title to mouse (window-relative click)")
+
+    # refine
+    p_refine = sub.add_parser("refine", help="SAM segment at cell → exact centroid")
+    p_refine.add_argument("args", nargs="+", help="[IMAGE_ID] CELL")
+    p_refine.add_argument("-t", "--title", help="Also click (window-relative)")
+
+    # clean
+    p_clean = sub.add_parser("clean", help="Remove sessions")
+    p_clean.add_argument("args", nargs="*", help="[SESSION_ID]")
+
+    # help
+    sub.add_parser("help", help="Show help")
+
+    if len(sys.argv) < 2:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+
+    if args.command == "capture":
+        cmd_capture(args)
+    elif args.command == "zoom":
+        cmd_zoom(args)
+    elif args.command == "resolve":
+        cmd_resolve(args)
+    elif args.command == "click":
+        cmd_click(args)
+    elif args.command == "refine":
+        cmd_refine(args)
+    elif args.command == "clean":
+        cmd_clean(args)
+    elif args.command == "help":
+        print(__doc__)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -19,29 +19,56 @@ You have a full Windows GUI automation toolkit at `~/bin/`. Use it to see, click
 | **wait_for** | Poll until text appears/disappears | For async UI, page loads, spinners |
 | **read_screen** | OCR all text from window | Structured output, position-sorted |
 | **detect** | YOLO object detection (open vocab) | ~15ms, "find chairs", "find buttons" |
+| **som** | Set-of-Marks: detect + number all elements | Pick element by ID |
+| **gridzoom** | Hierarchical grid navigation + SAM | Chess coords → pixel-perfect clicks |
 
 ### GPU servers
 
-Two persistent servers eliminate model loading overhead:
+Three persistent servers eliminate model loading overhead:
 
 ```bash
 find_text --start              # OCR server :18200 (~1.5s/scan)
 detect --start                 # YOLO server :18201 (~15ms/detect)
+python3 ~/bin/sam_server.py &  # SAM server :18202 (~3s/segment)
 ```
 
-Both run on GPU (RTX 4080). **Start both servers before interactive sessions.**
+All run on GPU (RTX 4080). **Start servers before interactive sessions.**
 
 ## Core workflow: tools-first, not vision-first
 
 **IMPORTANT: Your visual coordinate estimation is unreliable (~50-125px error). Never estimate pixel positions from screenshots. Always use tools for precision.**
 
-### Decision order for interacting with UI elements:
+### Targeting strategy — from lightweight to precise:
 
-1. **Has text?** → `click_text "Label" -t app` (OCR gives exact coordinates)
-2. **Is a known object?** → `detect -t app "object"` (YOLO gives exact bbox)
-3. **Need to read content?** → `read_screen -t app --text-only` (not screenshot)
-4. **Need coordinates near text?** → `find_text "Label" -t app` then `mouse click X,Y --offset`
-5. **None of above?** → crop the target area, use grid, estimate from small crop only
+1. **Has text?** → `click_text "Label" -t app` (OCR, ~2s, highest confidence)
+2. **Is a known object?** → `detect -t app "object"` (YOLO, ~15ms)
+3. **Need to see all elements?** → `som mark -t app` then `som click N -t app` (OCR + numbering)
+4. **No text, no detectable object?** → `gridzoom capture -t app` → `gridzoom zoom D4` → `gridzoom click B5 -t app` (grid navigation)
+5. **Grid cell not centered on target?** → `gridzoom refine B5 -t app` (SAM segmentation → exact centroid)
+
+### gridzoom quick reference
+
+```bash
+gridzoom capture -t chrome           # one hi-res grab, 10x10 grid
+gridzoom zoom D4                     # 3x3 window around D4 (default +1 padding)
+gridzoom zoom D4+2                   # 5x5 window (wider context)
+gridzoom click B5 -t chrome          # resolve cell → click
+gridzoom refine B5 -t chrome         # SAM segment → centroid → click
+gridzoom resolve B5                  # just print screen coordinates
+```
+
+**Key patterns:**
+- Capture once per session — grid coords are stable, reuse them for all clicks
+- Use `screenshot` for quick peeks between clicks (don't re-capture gridzoom)
+- Zoom produces both `_grid.png` (labeled) and `_clean.png` (raw) — read clean for visual judgment, grid for cell reference
+- Output includes coordinate map: `A1=65,70  B1=194,70  ...` for every cell
+
+### som quick reference
+
+```bash
+som mark -t chrome                   # detect all text elements, number them
+som click 17 -t chrome               # click element #17
+```
 
 ### Do NOT:
 - Take a screenshot and try to estimate pixel coordinates from it

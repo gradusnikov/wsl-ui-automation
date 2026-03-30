@@ -1,0 +1,65 @@
+@startuml strategy
+!theme plain
+skinparam backgroundColor #1a1a2e
+skinparam defaultFontColor #e0e0e0
+skinparam activityBackgroundColor #16213e
+skinparam activityBorderColor #0f3460
+skinparam activityDiamondBackgroundColor #533483
+skinparam activityDiamondBorderColor #0f3460
+skinparam arrowColor #e94560
+skinparam titleFontColor #e94560
+
+title UI Element Targeting Strategy\nFrom Lightweight to Precise
+
+start
+
+:Identify what to click;
+
+if (Has visible **text label**?) then (yes)
+  #00b894:**Level 1: click_text**
+  OCR-based, ~2s
+  Highest confidence;
+  :click_text "Submit" -t app;
+  stop
+else (no)
+endif
+
+if (Is a **known object class**?) then (yes)
+  #0984e3:**Level 2: detect (YOLO)**
+  Object detection, ~15ms
+  Open vocabulary;
+  :detect -t app "button";
+  stop
+else (no)
+endif
+
+if (Can enumerate **all elements**?) then (yes)
+  #6c5ce7:**Level 3: som mark**
+  OCR + numbered markers
+  Pick by ID;
+  :som mark -t app
+  som click 17 -t app;
+  stop
+else (no)
+endif
+
+if (Can identify **approximate area**?) then (yes)
+  #fdcb6e:**Level 4: gridzoom**
+  Hierarchical grid
+  Zoom + resolve;
+  :gridzoom capture -t app
+  gridzoom zoom D4
+  gridzoom click B5 -t app;
+  stop
+else (no)
+endif
+
+#e17055:**Level 5: gridzoom refine (SAM)**
+Segment Anything Model
+Exact object centroid;
+:gridzoom capture -t app
+gridzoom zoom D4
+gridzoom refine B5 -t app;
+stop
+
+@enduml
