@@ -30,6 +30,7 @@ package "Precision Targeting Layer" as precision #1a1a2e {
 }
 
 package "AI Vision Layer" as vision #1a1a2e {
+  [smart_click] as sc
   [click_text] as ct
   [find_text] as ft
   [read_screen] as rs
@@ -43,6 +44,9 @@ package "GPU Servers" as servers #0f3460 {
   [SAM Server\n:18202\nMobileSAM] as sam
 }
 
+cloud "Claude API" as api {
+}
+
 package "Windows API Layer" as winapi #1a1a2e {
   [screenshot] as ss
   [mouse] as m
@@ -53,6 +57,8 @@ package "Windows API Layer" as winapi #1a1a2e {
 cloud "Windows Desktop" as desktop {
 }
 
+sc --> ocr : OCR first
+sc --> api : LLM fallback
 ct --> ocr
 ft --> ocr
 rs --> ocr

@@ -9,23 +9,33 @@ skinparam activityDiamondBorderColor #0f3460
 skinparam arrowColor #e94560
 skinparam titleFontColor #e94560
 
-title UI Element Targeting Strategy\nFrom Lightweight to Precise
+title UI Element Targeting Strategy\nFrom Intelligent to Surgical
 
 start
 
 :Identify what to click;
 
-if (Has visible **text label**?) then (yes)
-  #00b894:**Level 1: click_text**
-  OCR-based, ~2s
-  Highest confidence;
+if (Can describe it in **natural language**?) then (yes)
+  #e94560:**Level 1: smart_click** ★
+  Hybrid OCR + LLM, ~2s
+  Most accurate (82.5% text, 40% icon);
+  :smart_click "Submit" -t app
+  smart_click "settings icon" -t app;
+  stop
+else (no)
+endif
+
+if (Know the **exact text label**?) then (yes)
+  #00b894:**Level 2: click_text**
+  Pure OCR, ~2s
+  No API cost;
   :click_text "Submit" -t app;
   stop
 else (no)
 endif
 
 if (Is a **known object class**?) then (yes)
-  #0984e3:**Level 2: detect (YOLO)**
+  #0984e3:**Level 4: detect (YOLO)**
   Object detection, ~15ms
   Open vocabulary;
   :detect -t app "button";
@@ -33,8 +43,8 @@ if (Is a **known object class**?) then (yes)
 else (no)
 endif
 
-if (Can enumerate **all elements**?) then (yes)
-  #6c5ce7:**Level 3: som mark**
+if (Need to see **all elements**?) then (yes)
+  #6c5ce7:**Level 5: som mark**
   OCR + numbered markers
   Pick by ID;
   :som mark -t app
@@ -44,9 +54,9 @@ else (no)
 endif
 
 if (Can identify **approximate area**?) then (yes)
-  #fdcb6e:**Level 4: gridzoom**
+  #fdcb6e:**Level 6: gridzoom**
   Hierarchical grid
-  Zoom + resolve;
+  Zoom + SAM refine;
   :gridzoom capture -t app
   gridzoom zoom D4
   gridzoom click B5 -t app;
@@ -54,12 +64,10 @@ if (Can identify **approximate area**?) then (yes)
 else (no)
 endif
 
-#e17055:**Level 5: gridzoom refine (SAM)**
+#e17055:**gridzoom refine (SAM)**
 Segment Anything Model
 Exact object centroid;
-:gridzoom capture -t app
-gridzoom zoom D4
-gridzoom refine B5 -t app;
+:gridzoom refine B5 -t app;
 stop
 
 @enduml
