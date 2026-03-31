@@ -11,7 +11,7 @@ Three layers, each building on the one below:
 | Layer | Tools | Purpose |
 |-------|-------|---------|
 | **Precision Targeting** | `gridzoom`, `som` | Hierarchical grid navigation, element numbering, SAM refinement |
-| **AI Vision** | `click_text`, `find_text`, `detect`, `read_screen`, `wait_for` | OCR text interaction, YOLO object detection |
+| **AI Vision** | `smart_click`, `click_text`, `find_text`, `detect`, `read_screen`, `wait_for` | Hybrid OCR+LLM, text interaction, object detection |
 | **Windows API** | `screenshot`, `mouse`, `sendkeys`, `winctl` | Direct capture, input, and window management |
 
 ### GPU Servers
@@ -26,42 +26,45 @@ python3 ~/bin/sam_server.py &  # SAM server :18202 (MobileSAM, ~3s/segment)
 
 ## UI Element Targeting Strategy
 
-The toolkit provides **five levels** of targeting precision, from lightweight to surgical. Always start at Level 1 and escalate only when needed.
+The toolkit provides **six levels** of targeting precision, from intelligent to surgical. Always start at Level 1 and escalate only when needed.
 
 ![Strategy](docs/diagrams/strategy.png)
 
-### Level 1: click_text (OCR) — fastest, most reliable
-For anything with a visible text label. One command, exact coordinates.
+### Level 1: smart_click (Hybrid OCR + LLM) — most accurate
+For any UI element described in natural language. OCR finds text labels; LLM vision finds icons, buttons, and semantic targets.
+```bash
+smart_click "Submit" -t chrome             # OCR handles this (~0.3s)
+smart_click "minimize this window" -t app  # LLM fallback for icons (~1.5s)
+smart_click "settings gear" -t chrome      # LLM understands visual semantics
+```
+
+### Level 2: click_text (OCR) — fastest for known text
+When you know the exact text label. Pure OCR, no API call needed.
 ```bash
 click_text "Submit" -t chrome              # ~2s, pixel-perfect
 click_text "Username" -t chrome --offset 200,0  # click input right of label
 ```
 
-### Level 2: detect (YOLO) — object detection
+### Level 4: detect (YOLO) — object detection
 For visual objects without text labels. Open vocabulary — describe what you see.
 ```bash
 detect -t chrome "button,icon"             # ~15ms
 detect -t chrome --coco                    # 80 fixed COCO classes
 ```
 
-### Level 3: som (Set-of-Marks) — enumerate all elements
+### Level 5: som (Set-of-Marks) — enumerate all elements
 When you need to see everything at once. OCR detects all text elements, numbers them, you pick by ID.
 ```bash
 som mark -t chrome                         # detect + annotate + list
 som click 17 -t chrome                     # click marker #17
 ```
 
-### Level 4: gridzoom (Grid Navigation) — hierarchical precision
+### Level 6: gridzoom (Grid Navigation) — hierarchical precision
 For elements that OCR/YOLO can't detect. Single capture, pure image manipulation zooms, chess-style coordinates.
 ```bash
 gridzoom capture -t chrome                 # one hi-res grab
 gridzoom zoom D4                           # 3x3 crop around D4
 gridzoom click B5 -t chrome                # resolve + click
-```
-
-### Level 5: gridzoom refine (SAM) — segment-level precision
-Last resort for tiny or ambiguous targets. SAM finds the exact object boundary at your grid cell and returns the centroid.
-```bash
 gridzoom refine B5 -t chrome               # SAM segment → exact centroid → click
 ```
 
@@ -117,6 +120,37 @@ Every command produces:
 - **Coordinate map** — text table of all cell centers in window coordinates
 - **JSON metadata** — affine transform, grid params, depth, parent linkage
 
+## smart_click — Hybrid OCR + LLM Vision
+
+The highest-accuracy targeting tool. Tries OCR first (fast, free), falls back to Claude vision when OCR confidence is low. Beats published GUI grounding models on the ScreenSpot desktop benchmark.
+
+```bash
+smart_click "minimize this window" -t app      # auto-routes: OCR or LLM
+smart_click "Submit" -t chrome                 # OCR handles text labels
+smart_click "settings icon" -t app --verbose   # see routing decision
+smart_click "close" --dry-run --json           # find only, structured output
+smart_click "upload" --llm-only --model sonnet # force LLM with Sonnet
+smart_click "Save" --ocr-only                  # disable LLM (same as click_text)
+```
+
+Options: `--threshold` (OCR confidence cutoff, default 0.3), `--model` (haiku/sonnet/opus), `--ocr-only`, `--llm-only`, `--offset`, `--right`, `--double`.
+
+Requires `ANTHROPIC_API_KEY` for LLM fallback.
+
+## Benchmark: ScreenSpot
+
+Evaluated on the [ScreenSpot](https://github.com/njucckevin/SeeClick) GUI grounding benchmark (desktop, 334 entries). Full results in [`benchmark/screenspot/RESULTS.md`](benchmark/screenspot/RESULTS.md).
+
+| Model | Desktop Text | Desktop Icon |
+|---|---|---|
+| GPT-4V | 20.2% | 11.8% |
+| CogAgent (18B) | 74.2% | 20.0% |
+| SeeClick (9.6B) | 72.2% | 30.0% |
+| **smart_click (ours)** | **82.5%** | **40.0%** |
+| smart_click agentic | 70.6% | 47.9% |
+
+Zero-shot hybrid pipeline (EasyOCR + Claude Haiku) outperforms fine-tuned GUI grounding models. Fixed routing (OCR first, LLM fallback at threshold 0.3) beats both agentic tool use and direct LLM approaches. OCR handles text elements with higher precision than VLMs; LLM vision handles icons that OCR cannot see.
+
 ## Setup
 
 ### Prerequisites
@@ -127,14 +161,18 @@ Every command produces:
 ### Installation
 
 ```bash
-# Copy tools to ~/bin/ (must be in PATH)
-cp bin/* ~/bin/
+# Symlink tools to ~/bin/ (must be in PATH)
+for f in ~/devel/wsl-ui-automation/bin/*; do
+  ln -sf "$f" ~/bin/"$(basename "$f")"
+done
 
 # Install Python dependencies
-pip install ultralytics easyocr torch torchvision opencv-python Pillow
+pip install ultralytics easyocr torch torchvision opencv-python Pillow anthropic
 
-# Copy Claude Code skills (optional, for slash commands)
-cp skills/*.md ~/.claude/commands/
+# Symlink Claude Code skills (for slash commands)
+for f in ~/devel/wsl-ui-automation/skills/*.md; do
+  ln -sf "$f" ~/.claude/commands/"$(basename "$f")"
+done
 ```
 
 ### Start GPU servers
@@ -156,11 +194,12 @@ python3 ~/bin/sam_server.py &  # SAM server on :18202
 | `sendkeys` | Type text, press keys | `sendkeys -t app "hello"` |
 | `winctl` | Manage windows | `winctl focus chrome` |
 
-### AI Vision: OCR-powered
+### AI Vision: Hybrid + OCR-powered
 
 | Tool | Purpose | Example |
 |------|---------|---------|
-| `click_text` | Find text + click | `click_text "Submit" -t chrome` |
+| `smart_click` | **Hybrid OCR+LLM** find + click | `smart_click "minimize" -t app` |
+| `click_text` | Find text + click (OCR only) | `click_text "Submit" -t chrome` |
 | `find_text` | Find text position | `find_text "Search" -t chrome` |
 | `wait_for` | Wait for text appear/disappear | `wait_for "Done" -t chrome` |
 | `read_screen` | OCR all text on screen | `read_screen -t chrome --text-only` |
@@ -193,6 +232,8 @@ With GPU servers running (RTX 4080):
 | **YOLO detection** | **~15ms** | :18201 |
 | OCR scan | ~1.5s | :18200 |
 | `click_text` end-to-end | ~2s | :18200 |
+| `smart_click` (OCR path) | ~2s | :18200 |
+| `smart_click` (LLM fallback) | ~2.5s | :18200 + API |
 | `som mark` (full page) | ~2s | :18200 |
 | `gridzoom capture + zoom` | ~1s | — |
 | `gridzoom refine` (SAM) | ~3s | :18202 |

@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""Smart UI element finder + clicker. OCR first, LLM vision fallback.
+
+Finds a UI element described by natural language and clicks it.
+Uses OCR text matching first (fast, free). When OCR confidence is low,
+falls back to Claude vision to locate the element visually.
+
+Usage:
+  smart_click "minimize this window"                    Find and click
+  smart_click "save the file" --title notepad           Target window
+  smart_click "close" --dry-run                         Find only, no click
+  smart_click "upload button" --model sonnet            Use Sonnet for LLM
+  smart_click "settings icon" --ocr-only                No LLM fallback
+  smart_click "open gallery" --llm-only                 Skip OCR, use LLM
+  smart_click "Submit" --file screenshot.png            Use image file
+
+Options:
+  -t, --title PATTERN    Capture window matching pattern
+  -f, --file PATH        Use existing image file instead of capturing
+  --right                Right-click instead of left-click
+  --double               Double-click
+  --offset X,Y           Offset from element center (e.g., '0,-20')
+  --dry-run              Find only, don't click
+  -j, --json             Output as JSON
+  --model MODEL          LLM model: haiku (default), sonnet, opus
+  --threshold FLOAT      OCR confidence threshold for LLM fallback (default: 0.3)
+  --ocr-only             Disable LLM fallback (same as click_text)
+  --llm-only             Skip OCR, go straight to LLM
+  -v, --verbose          Show detailed routing info
+"""
+import sys
+import os
+import json
+import time
+import base64
+import re
+import struct
+import argparse
+import subprocess
+import urllib.request
+
+SCREENSHOT_BIN = os.path.expanduser("~/bin/screenshot")
+MOUSE_BIN = os.path.expanduser("~/bin/mouse")
+OCR_URL = "http://127.0.0.1:18200"
+
+MODEL_MAP = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+}
+
+SYSTEM_PROMPT = (
+    "You are a UI element locator. Given a screenshot and an instruction "
+    "describing a UI element to interact with, identify the exact pixel "
+    "coordinates to click.\n\n"
+    "Output ONLY: CLICK(x, y)\n"
+    "- x = horizontal pixels from left edge\n"
+    "- y = vertical pixels from top edge\n"
+    "- Target the CENTER of the element\n"
+    "- No explanation, just CLICK(x, y)"
+)
+
+COORD_RE = re.compile(r"CLICK\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+
+STOP_WORDS = {
+    "the", "a", "an", "this", "that", "these", "those",
+    "to", "for", "of", "in", "on", "at", "by", "with",
+    "is", "are", "was", "were", "be", "been",
+    "and", "or", "but", "not", "no",
+    "i", "my", "me", "it", "its",
+}
+
+ACTION_VERBS = {
+    "open", "close", "click", "press", "tap", "select", "choose",
+    "go", "navigate", "switch", "toggle", "turn", "set", "get",
+    "find", "search", "look", "check", "view", "show", "display",
+    "enter", "type", "input", "write", "fill",
+    "save", "delete", "remove", "add", "create", "new",
+    "play", "pause", "stop", "start", "run", "launch",
+    "minimize", "maximize", "restore", "resize",
+    "copy", "paste", "cut", "undo", "redo",
+    "scroll", "drag", "drop", "move",
+    "adjust", "change", "modify", "update", "edit",
+    "enable", "disable", "activate", "deactivate",
+    "expand", "collapse", "fold", "unfold",
+    "access", "use", "apply", "submit", "confirm", "cancel",
+    "download", "upload", "install", "uninstall",
+    "refresh", "reload", "sync",
+    "sign", "log", "login", "logout",
+}
+
+
+# --- OCR ---
+
+def ocr_server_running():
+    try:
+        req = urllib.request.Request(f"{OCR_URL}/health", method="GET")
+        resp = urllib.request.urlopen(req, timeout=1)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def ocr_image(image_path):
+    with open(image_path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        f"{OCR_URL}/ocr", data=data,
+        headers={"Content-Type": "application/octet-stream"}, method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    return json.loads(resp.read().decode())
+
+
+def ocr_direct(image_path):
+    import cv2
+    import easyocr
+    print("No OCR server. Direct OCR (slow)...", file=sys.stderr)
+    reader = easyocr.Reader(["pl", "en"], gpu=True, verbose=False)
+    image = cv2.imread(image_path)
+    results = reader.readtext(image)
+    regions = []
+    for bbox, text, conf in results:
+        xs = [int(p[0]) for p in bbox]
+        ys = [int(p[1]) for p in bbox]
+        x1, y1 = min(xs), min(ys)
+        x2, y2 = max(xs), max(ys)
+        regions.append({
+            "text": text,
+            "confidence": round(float(conf), 3),
+            "bbox": [x1, y1, x2 - x1, y2 - y1],
+            "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+        })
+    return regions
+
+
+def get_ocr_regions(image_path):
+    if ocr_server_running():
+        return ocr_image(image_path)
+    return ocr_direct(image_path)
+
+
+# --- Text matching ---
+
+def fuzzy_match(query, text):
+    q, t = query.lower(), text.lower()
+    if q == t:
+        return 1.0
+    if q in t:
+        return 0.9 * (len(q) / len(t))
+    if t in q:
+        return 0.8 * (len(t) / len(q))
+    qw, tw = q.split(), t.split()
+    if len(qw) > 1 and all(any(qw_ in tw_ for tw_ in tw) for qw_ in qw):
+        return 0.7
+    return 0.0
+
+
+def extract_target_noun(instruction):
+    words = instruction.lower().strip().split()
+    while words and (words[0] in ACTION_VERBS or words[0] in STOP_WORDS):
+        words = words[1:]
+    return " ".join(words) if words else instruction.lower()
+
+
+def extract_keywords(instruction):
+    words = instruction.lower().strip().split()
+    kw = [w for w in words if w not in STOP_WORDS and w not in ACTION_VERBS and len(w) > 1]
+    if not kw:
+        kw = [w for w in words if w not in STOP_WORDS and len(w) > 1]
+    if not kw:
+        kw = [w for w in words if len(w) > 1]
+    return kw
+
+
+def ocr_find_best(instruction, regions):
+    """Run all OCR matching strategies, return best match dict or None."""
+    if not regions:
+        return None
+
+    candidates = []
+
+    # Direct fuzzy match
+    for r in regions:
+        s = fuzzy_match(instruction, r["text"])
+        if s > 0:
+            candidates.append((r, s, "direct"))
+
+    # Target noun
+    target = extract_target_noun(instruction)
+    if target:
+        for r in regions:
+            s = fuzzy_match(target, r["text"])
+            if s > 0:
+                candidates.append((r, s, "noun"))
+
+    # Reverse containment
+    instr_lower = instruction.lower()
+    for r in regions:
+        t = r["text"].lower().strip()
+        if len(t) < 2:
+            continue
+        if t in instr_lower:
+            s = len(t) / len(instr_lower)
+            candidates.append((r, s, "reverse"))
+        else:
+            for word in t.split():
+                if len(word) >= 3 and word in instr_lower:
+                    s = len(word) / len(instr_lower) * 0.8
+                    candidates.append((r, s, "reverse"))
+
+    # Keyword match
+    for kw in extract_keywords(instruction):
+        for r in regions:
+            s = fuzzy_match(kw, r["text"])
+            s *= min(1.0, len(kw) / 4) * 0.9
+            if s > 0:
+                candidates.append((r, s, "keyword"))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    region, score, method = candidates[0]
+    return {
+        "x": region["center"][0],
+        "y": region["center"][1],
+        "text": region["text"],
+        "bbox": region["bbox"],
+        "confidence": region["confidence"],
+        "score": score,
+        "method": f"ocr_{method}",
+    }
+
+
+# --- LLM vision ---
+
+def get_image_dims(path):
+    with open(path, "rb") as f:
+        header = f.read(32)
+    if header[:4] == b"\x89PNG":
+        w, h = struct.unpack(">II", header[16:24])
+        return w, h
+    import cv2
+    img = cv2.imread(str(path))
+    return img.shape[1], img.shape[0]
+
+
+def llm_find(image_path, instruction, model_name="haiku"):
+    import anthropic
+
+    model_id = MODEL_MAP.get(model_name, model_name)
+    w, h = get_image_dims(image_path)
+
+    with open(image_path, "rb") as f:
+        img_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+
+    client = anthropic.Anthropic()
+    t0 = time.time()
+    response = client.messages.create(
+        model=model_id,
+        max_tokens=100,
+        system=SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": img_b64},
+                },
+                {
+                    "type": "text",
+                    "text": f"Image: {w}x{h} pixels\nInstruction: {instruction}\nCLICK(x, y):",
+                },
+            ],
+        }],
+    )
+    reply = response.content[0].text
+    latency = time.time() - t0
+
+    m = COORD_RE.search(reply)
+    if m:
+        return {
+            "x": int(m.group(1)),
+            "y": int(m.group(2)),
+            "text": instruction,
+            "score": 1.0,
+            "method": "llm",
+            "model": model_id,
+            "latency": round(latency, 2),
+        }
+
+    # Fallback: grab any two numbers
+    nums = re.findall(r"\b(\d{2,4})\b", reply)
+    if len(nums) >= 2:
+        return {
+            "x": int(nums[0]),
+            "y": int(nums[1]),
+            "text": instruction,
+            "score": 0.8,
+            "method": "llm_fallback",
+            "model": model_id,
+            "latency": round(latency, 2),
+        }
+
+    return None
+
+
+# --- Screenshot ---
+
+def capture_screenshot(title=None):
+    tmp = "/tmp/_smart_click_capture.png"
+    cmd = [SCREENSHOT_BIN, tmp]
+    if title:
+        cmd += ["--title", title]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return tmp
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Smart UI element finder: OCR first, LLM vision fallback")
+    parser.add_argument("query", help="Natural language description of the UI element")
+    parser.add_argument("-t", "--title", help="Window title/process to capture")
+    parser.add_argument("-f", "--file", help="Use image file instead of capturing")
+    parser.add_argument("--right", action="store_true", help="Right-click")
+    parser.add_argument("--double", action="store_true", help="Double-click")
+    parser.add_argument("--offset", help="X,Y offset from center (e.g., '0,-20')")
+    parser.add_argument("--dry-run", action="store_true", help="Find only, don't click")
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+    parser.add_argument("--model", default="haiku", choices=list(MODEL_MAP.keys()),
+                        help="LLM model for fallback (default: haiku)")
+    parser.add_argument("--threshold", type=float, default=0.3,
+                        help="OCR confidence threshold for LLM fallback (default: 0.3)")
+    parser.add_argument("--ocr-only", action="store_true",
+                        help="Disable LLM fallback (same as click_text)")
+    parser.add_argument("--llm-only", action="store_true",
+                        help="Skip OCR, go straight to LLM")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show detailed routing info")
+    args = parser.parse_args()
+
+    instruction = args.query.strip()
+    t_start = time.time()
+
+    # 1. Capture screenshot
+    if args.file:
+        image_path = args.file
+        if not os.path.exists(image_path):
+            print(f"File not found: {image_path}", file=sys.stderr)
+            sys.exit(2)
+    else:
+        try:
+            image_path = capture_screenshot(args.title)
+        except Exception as e:
+            print(f"Screenshot failed: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    result = None
+
+    # 2. Try OCR first (unless --llm-only)
+    if not args.llm_only:
+        t_ocr = time.time()
+        try:
+            regions = get_ocr_regions(image_path)
+            ocr_match = ocr_find_best(instruction, regions)
+        except Exception as e:
+            print(f"OCR error: {e}", file=sys.stderr)
+            ocr_match = None
+
+        ocr_elapsed = time.time() - t_ocr
+
+        if ocr_match and ocr_match["score"] >= args.threshold:
+            result = ocr_match
+            if args.verbose:
+                print(f"OCR hit: score={ocr_match['score']:.2f} "
+                      f"matched='{ocr_match['text']}' [{ocr_elapsed:.1f}s]",
+                      file=sys.stderr)
+        elif args.verbose:
+            score_str = f"score={ocr_match['score']:.2f}" if ocr_match else "no match"
+            print(f"OCR miss: {score_str} (threshold={args.threshold}) [{ocr_elapsed:.1f}s]",
+                  file=sys.stderr)
+
+    # 3. LLM fallback if needed
+    if result is None and not args.ocr_only:
+        if args.verbose:
+            print(f"Falling back to LLM ({args.model})...", file=sys.stderr)
+        try:
+            result = llm_find(image_path, instruction, args.model)
+            if result and args.verbose:
+                print(f"LLM hit: ({result['x']},{result['y']}) [{result.get('latency', 0):.1f}s]",
+                      file=sys.stderr)
+            elif args.verbose:
+                print("LLM: no coordinates returned", file=sys.stderr)
+        except Exception as e:
+            print(f"LLM error: {e}", file=sys.stderr)
+
+    # 4. Handle no result
+    if result is None:
+        if args.json:
+            print(json.dumps({"found": False, "instruction": instruction}))
+        else:
+            print(f"Not found: '{instruction}'", file=sys.stderr)
+        sys.exit(1)
+
+    # 5. Apply offset
+    cx, cy = result["x"], result["y"]
+    if args.offset:
+        try:
+            ox, oy = map(int, args.offset.split(","))
+            cx += ox
+            cy += oy
+        except ValueError:
+            print(f"Invalid offset: {args.offset}", file=sys.stderr)
+            sys.exit(2)
+
+    total_elapsed = time.time() - t_start
+
+    # 6. Output
+    if args.json:
+        output = {
+            "found": True,
+            "x": cx, "y": cy,
+            "method": result["method"],
+            "matched": result.get("text", ""),
+            "score": round(result.get("score", 0), 3),
+            "elapsed": round(total_elapsed, 2),
+        }
+        if "bbox" in result:
+            output["bbox"] = result["bbox"]
+        if "model" in result:
+            output["model"] = result["model"]
+        print(json.dumps(output))
+    else:
+        method_tag = result["method"].upper()
+        print(f'{cx},{cy}  "{result.get("text", "")}"  [{method_tag}]',
+              file=sys.stderr)
+
+    # 7. Click (unless --dry-run)
+    if not args.dry_run:
+        if args.double:
+            click_cmd = "dclick"
+        elif args.right:
+            click_cmd = "rclick"
+        else:
+            click_cmd = "click"
+
+        cmd = [MOUSE_BIN, click_cmd, f"{cx},{cy}"]
+        if args.title:
+            cmd += ["--title", args.title]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except Exception as e:
+            print(f"Click failed: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

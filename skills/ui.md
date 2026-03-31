@@ -10,8 +10,9 @@ You have a full Windows GUI automation toolkit at `~/bin/`. Use it to see, click
 
 | Tool | Purpose | Notes |
 |---|---|---|
-| **som** | Set-of-Marks: detect + number all elements | **Default tool** — see everything, pick by ID |
-| **click_text** | OCR + click in one command | When you already know the exact text label |
+| **smart_click** | **Hybrid OCR + LLM** find + click | **Most accurate** — handles text AND icons |
+| **som** | Set-of-Marks: detect + number all elements | See everything, pick by ID |
+| **click_text** | OCR + click in one command | Fast, when you know the exact text label |
 | **find_text** | OCR: find text position on screen | Returns coordinates for clicking |
 | **read_screen** | OCR all text from window | Structured output, position-sorted |
 | **wait_for** | Poll until text appears/disappears | For async UI, page loads, spinners |
@@ -37,18 +38,19 @@ All run on GPU (RTX 4080). **Start servers before interactive sessions.**
 
 **IMPORTANT: Never estimate pixel positions from screenshots. Never use screenshot crops to locate elements. Always use the targeting tools below.**
 
-### Targeting strategy — always start with som:
+### Targeting strategy:
 
-1. **Start here →** `som mark -t app` — see ALL elements numbered, pick by ID. This is your default.
-2. **Know the exact label?** → `click_text "Label" -t app` — shortcut when you're certain of the text
-3. **Element has no text?** → `gridzoom capture -t app` → `gridzoom zoom D4` → `gridzoom click B5 -t app`
-4. **Need sub-cell precision?** → `gridzoom refine B5 -t app` — SAM segmentation → exact centroid
-5. **Is a known object class?** → `detect -t app "object"` — YOLO, ~15ms
+1. **Default →** `smart_click "description" -t app` — handles both text and icons via hybrid OCR + LLM. Fastest path from intent to click.
+2. **Need UI overview?** → `som mark -t app` — see ALL elements numbered, pick by ID
+3. **Know the exact label?** → `click_text "Label" -t app` — pure OCR, no API call, fastest
+4. **Element has no text?** → `gridzoom capture -t app` → `gridzoom zoom D4` → `gridzoom click B5 -t app`
+5. **Need sub-cell precision?** → `gridzoom refine B5 -t app` — SAM segmentation → exact centroid
+6. **Is a known object class?** → `detect -t app "object"` — YOLO, ~15ms
 
 ### Do NOT:
 - Use `screenshot` — use `som mark` to see the UI (it captures a screenshot internally and gives you both marked + clean images)
 - Estimate pixel coordinates visually — always use a tool
-- Default to `click_text` before understanding the UI — use `som mark` first to see what's there
+- Default to `click_text` for icons/non-text elements — use `smart_click` instead, it falls back to LLM vision
 
 ## som — Set-of-Marks
 
@@ -98,7 +100,19 @@ gridzoom clean                       # remove session files
 
 ## Quick reference
 
-### click_text — PRIMARY tool for clicking UI elements
+### smart_click — MOST ACCURATE tool for clicking UI elements
+```bash
+smart_click "minimize this window" -t app      # auto-routes: OCR or LLM
+smart_click "Submit" -t chrome                 # OCR handles text labels fast
+smart_click "settings icon" -t app             # LLM handles icons
+smart_click "close" --dry-run --json           # find only, structured output
+smart_click "Upload" -t chrome --ocr-only      # no LLM fallback (= click_text)
+smart_click "gear icon" --llm-only             # skip OCR, use LLM directly
+smart_click "Tab" -t app --offset 0,-20        # offset from element center
+smart_click "Save" -t app --model sonnet       # use Sonnet instead of Haiku
+```
+
+### click_text — fast OCR-only clicking (no API cost)
 ```bash
 click_text "Search" -t chrome              # find and click text
 click_text "Submit" -t chrome --right      # right-click
@@ -217,13 +231,14 @@ gridzoom refine B5 -t app                  # SAM finds exact object centroid
 
 When the user says `/ui`, parse their intent:
 
-- **"click on X"** → `som mark -t <app>` to find it, then `som click N` (or `click_text "X"` if you're sure of the label)
+- **"click on X"** → `smart_click "X" -t <app>` — handles text labels AND icons/visual targets
+- **"click the icon/button"** → `smart_click "description" -t <app>` — LLM understands icons
 - **"read/what's on screen"** → `read_screen -t <app>`
-- **"type X into Y"** → `som mark -t <app>` to find the field, `som click N`, then `sendkeys -t <app> "X"`
-- **"interact with this app"** → `som mark -t <app>` first — always start by seeing what's there
+- **"type X into Y"** → `smart_click "Y" -t <app>` to find the field, then `sendkeys -t <app> "X"`
+- **"interact with this app"** → `som mark -t <app>` first — see what's there, then act
 - **"wait for X"** → `wait_for "X" -t <app>`
 - **"scroll down"** → `mouse scroll down -t <app>`
 - **"list windows"** → `winctl list`
-- **"find the button/icon"** → `som mark -t <app>` → if not found → `gridzoom capture -t <app>`
+- **"find the button/icon"** → `smart_click "description" -t <app> --dry-run` — find without clicking
 
 $ARGUMENTS
